@@ -1,19 +1,25 @@
 ﻿#!/usr/bin/env python3
 """
-Windows 楂樻€ц兘鐗堬細M1616M + TB100 鍙岃澶囧悓姝ユ姄鍙?瑙ｅ寘
+Windows high-performance dual sensor runner.
 
-璁捐鐩爣锛?- 浠?Windows 鍘熺敓 COM
-- 涓插彛閲囬泦涓庤В鍖呭垎绾跨▼锛堥槦鍒楄В鑰︼級
-- pyqtgraph 楂樺埛鏂板彲瑙嗗寲锛堝彲 OpenGL锛?- 鍘嬪姏 + IMU 鎸変富鏈烘椂閽熸渶杩戦偦鍚屾
+Features:
+- M1616M pressure stream parser (16x16 matrix)
+- TB100 IMU stream parser (quat + acceleration)
+- Multi-threaded serial ingest + parse
+- Pressure heatmap visualization with interpolation
+- Optional IMU 3D visualization with OpenGL fallback strategy
+- Optional OBJ racket model rendering and real-time pose sync
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import queue
 import struct
+import sys
 import threading
 import time
 from collections import deque
@@ -25,7 +31,27 @@ import numpy as np
 import serial
 
 
-# ---------------------------- 鏁版嵁缁撴瀯 ----------------------------
+OPENGL_INSTALL_HINT = "pip install PyOpenGL PyOpenGL_accelerate"
+DEFAULT_RACKET_OBJ = Path("obj/badminton_racket/Racket.obj")
+
+UI_TEXT = {
+    "title": "Dual Sensor SAGE (Windows High Performance)",
+    "waiting": "Waiting data...",
+    "zero_btn_start": "Start Zero Calibration",
+    "zero_btn_clear": "Clear Zero Calibration",
+    "imu_btn_reset": "Reset IMU Zero",
+    "imu3d_unavailable_prefix": "IMU 3D unavailable:",
+    "zero_not_calibrated": "Zero calibration: not calibrated",
+    "zero_running": "Zero calibration: running",
+    "zero_enabled": "enabled",
+    "zero_disabled": "disabled",
+    "zero_cleared": "Zero calibration: cleared",
+}
+
+
+class OpenGLAutoRetryRequested(RuntimeError):
+    """Signal to restart process once with software OpenGL."""
+
 
 @dataclass
 class PressureFrame:
@@ -45,7 +71,14 @@ class ImuFrame:
     simple_sum_ok: bool
 
 
-# ---------------------------- 鍗忚杈呭姪 ----------------------------
+@dataclass
+class ObjMesh:
+    vertices: np.ndarray  # (N,3) float32
+    faces: np.ndarray  # (M,3) int32
+    texcoords: Optional[np.ndarray] = None  # (N,2) float32
+    texture_path: Optional[Path] = None
+    vertex_colors: Optional[np.ndarray] = None  # (N,4) float32
+
 
 def modbus_crc16(data: bytes) -> int:
     crc = 0xFFFF
@@ -83,8 +116,6 @@ def configure_pressure_sensor_range(ser: serial.Serial, pressure_range: str, suf
     print(f"[PRESSURE] Range set request sent: {pressure_range} ({cmd_setf}) + SET=OK")
 
 
-# ---------------------------- 瑙ｆ瀽鍣?----------------------------
-
 class M1616MParser:
     HEADER = b"\xAA\xAB\xAC"
     FRAME_LEN = 516
@@ -102,10 +133,8 @@ class M1616MParser:
                 if len(self.buf) > 2:
                     self.buf = self.buf[-2:]
                 break
-
             if idx > 0:
                 del self.buf[:idx]
-
             if len(self.buf) < self.FRAME_LEN:
                 break
 
@@ -156,7 +185,6 @@ class TB100Parser:
         ) = struct.unpack(fmt, payload)
 
         simple_ok = (sum(payload[:62]) & 0xFFFF) == simple_sum_i
-
         return ImuFrame(
             host_ts=host_ts,
             device_ts_us=ts_us,
@@ -177,10 +205,8 @@ class TB100Parser:
                 if len(self.buf) > 1:
                     self.buf = self.buf[-1:]
                 break
-
             if idx > 0:
                 del self.buf[:idx]
-
             if len(self.buf) < 5:
                 break
 
@@ -191,7 +217,6 @@ class TB100Parser:
 
             frame = bytes(self.buf[:frame_len])
             crc_ok = int.from_bytes(frame[-2:], "little") == modbus_crc16(frame[2:-2])
-
             if payload_len >= 68:
                 content = frame[3 : 3 + payload_len]
                 payload64 = content[4:68]
@@ -205,8 +230,6 @@ class TB100Parser:
 
         return out
 
-
-# ---------------------------- 楂樻€ц兘骞跺彂 ----------------------------
 
 class SerialIngestThread(threading.Thread):
     def __init__(
@@ -253,7 +276,8 @@ class SerialIngestThread(threading.Thread):
                 try:
                     self.out_q.put_nowait(item)
                 except queue.Full:
-                    self.stats[f"{self.name.lower()}_drop_chunks"] = self.stats.get(f"{self.name.lower()}_drop_chunks", 0) + 1
+                    key = f"{self.name.lower()}_drop_chunks"
+                    self.stats[key] = self.stats.get(key, 0) + 1
         finally:
             if self.ser and self.ser.is_open:
                 self.ser.close()
@@ -284,15 +308,14 @@ class ParserThread(threading.Thread):
                 ts, chunk = self.in_q.get(timeout=0.05)
             except queue.Empty:
                 continue
-
             frames = self.parser.feed(chunk, host_ts=ts)
-            if frames:
-                self.stats[f"{self.name.lower()}_parsed_frames"] = self.stats.get(f"{self.name.lower()}_parsed_frames", 0) + len(frames)
-                for f in frames:
-                    self.on_frame(f)
+            if not frames:
+                continue
+            key = f"{self.name.lower()}_parsed_frames"
+            self.stats[key] = self.stats.get(key, 0) + len(frames)
+            for frame in frames:
+                self.on_frame(frame)
 
-
-# ---------------------------- 涓荤▼搴?----------------------------
 
 def nearest_imu(ts: float, imu_buf: Deque[ImuFrame], max_dt_sec: float) -> Optional[ImuFrame]:
     if not imu_buf:
@@ -372,13 +395,348 @@ def quat_wxyz_to_rotmat(quat_wxyz: Tuple[float, float, float, float]) -> np.ndar
 
 
 def imu_rot_sensor_to_world(quat_wxyz: Tuple[float, float, float, float], quat_world_to_sensor: bool) -> np.ndarray:
-    # TB100 quaternion convention may differ by firmware; provide runtime switch.
     rot = quat_wxyz_to_rotmat(quat_wxyz)
     return rot.T if quat_world_to_sensor else rot
 
 
-def build_racket_model_sensor_frame() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    # Sensor is at butt cap; butt -> head points to sensor -Z.
+def rotate_points(points: np.ndarray, rot: np.ndarray) -> np.ndarray:
+    return (rot @ points.T).T.astype(np.float32, copy=False)
+
+
+def euler_deg_to_rotmat(roll_deg: float, pitch_deg: float, yaw_deg: float) -> np.ndarray:
+    rx = math.radians(roll_deg)
+    ry = math.radians(pitch_deg)
+    rz = math.radians(yaw_deg)
+    cx, sx = math.cos(rx), math.sin(rx)
+    cy, sy = math.cos(ry), math.sin(ry)
+    cz, sz = math.cos(rz), math.sin(rz)
+
+    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=np.float32)
+    rot_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=np.float32)
+    rot_z = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+    return (rot_z @ rot_y @ rot_x).astype(np.float32)
+
+
+def safe_normalize(v: np.ndarray, fallback: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < 1e-8:
+        return fallback.astype(np.float32)
+    return (v / n).astype(np.float32)
+
+
+def parse_obj_index(index_text: str, n_items: int) -> int:
+    idx = int(index_text)
+    if idx > 0:
+        idx -= 1
+    else:
+        idx = n_items + idx
+    return idx
+
+
+def parse_obj_face_token(token: str, n_vertices: int, n_texcoords: int) -> Tuple[int, int]:
+    parts = token.split("/")
+    if len(parts) == 0 or parts[0] == "":
+        raise ValueError("invalid face token")
+
+    v_idx = parse_obj_index(parts[0], n_vertices)
+    vt_idx = -1
+    if len(parts) >= 2 and parts[1] != "":
+        vt_idx = parse_obj_index(parts[1], n_texcoords)
+    return v_idx, vt_idx
+
+
+def parse_obj_mtllib_entries(line_rest: str) -> List[str]:
+    rest = line_rest.strip()
+    if not rest:
+        return []
+    entries = [rest]
+    for token in rest.split():
+        if token not in entries:
+            entries.append(token)
+    return entries
+
+
+def resolve_mtl_texture(obj_path: Path, mtllib_entries: List[str]) -> Optional[Path]:
+    obj_dir = obj_path.parent
+    for entry in mtllib_entries:
+        mtl_path = (obj_dir / entry).resolve()
+        if not mtl_path.exists():
+            continue
+        try:
+            with mtl_path.open("r", encoding="utf-8", errors="ignore") as fp:
+                for raw in fp:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if not line.lower().startswith("map_kd "):
+                        continue
+                    tex_rel = line.split(None, 1)[1].strip().strip('"').strip("'")
+                    cand = (mtl_path.parent / tex_rel).resolve()
+                    if cand.exists():
+                        return cand
+                    # Fallback for option-style lines where path is the tail token.
+                    tail = tex_rel.split()[-1]
+                    cand_tail = (mtl_path.parent / tail).resolve()
+                    if cand_tail.exists():
+                        return cand_tail
+        except Exception:
+            continue
+
+    # Heuristic fallback for exports that include texture files but no map_Kd bindings.
+    tex_dir = obj_dir / "Textures"
+    if tex_dir.exists():
+        images: List[Path] = []
+        for pattern in ("*.png", "*.jpg", "*.jpeg", "*.PNG", "*.JPG", "*.JPEG"):
+            images.extend(sorted(tex_dir.glob(pattern)))
+        if images:
+            def texture_rank(p: Path) -> Tuple[int, int, str]:
+                name = p.name.lower()
+                uv_score = 0
+                if "uv" in name:
+                    uv_score += 3
+                if "texture" in name:
+                    uv_score += 2
+                if "handle" in name:
+                    uv_score -= 1
+                return (-uv_score, len(name), name)
+
+            images.sort(key=texture_rank)
+            return images[0].resolve()
+    return None
+
+
+def sample_vertex_colors_from_texture(texcoords: np.ndarray, texture_path: Path, QtGui) -> Optional[np.ndarray]:
+    if texcoords is None or texcoords.size == 0:
+        return None
+    img = QtGui.QImage(str(texture_path))
+    if img.isNull():
+        return None
+    img = img.convertToFormat(QtGui.QImage.Format_RGBA8888)
+    w = img.width()
+    h = img.height()
+    if w <= 1 or h <= 1:
+        return None
+
+    colors = np.empty((texcoords.shape[0], 4), dtype=np.float32)
+    for i in range(texcoords.shape[0]):
+        u = float(texcoords[i, 0]) % 1.0
+        v = float(texcoords[i, 1]) % 1.0
+        x = int(round(u * (w - 1)))
+        y = int(round((1.0 - v) * (h - 1)))
+        c = img.pixelColor(x, y)
+        colors[i, 0] = c.redF()
+        colors[i, 1] = c.greenF()
+        colors[i, 2] = c.blueF()
+        colors[i, 3] = 1.0
+    return colors
+
+
+def load_obj_mesh(path: Path) -> ObjMesh:
+    raw_vertices: List[Tuple[float, float, float]] = []
+    raw_texcoords: List[Tuple[float, float]] = []
+    out_vertices: List[Tuple[float, float, float]] = []
+    out_texcoords: List[Tuple[float, float]] = []
+    faces: List[Tuple[int, int, int]] = []
+    vt_used_any = False
+    remap: dict = {}
+    mtllib_entries: List[str] = []
+
+    with path.open("r", encoding="utf-8", errors="ignore") as fp:
+        for raw in fp:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("mtllib "):
+                mtllib_entries.extend(parse_obj_mtllib_entries(line.split(None, 1)[1]))
+                continue
+            if line.startswith("v "):
+                parts = line.split()
+                if len(parts) >= 4:
+                    raw_vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                continue
+            if line.startswith("vt "):
+                parts = line.split()
+                if len(parts) >= 3:
+                    raw_texcoords.append((float(parts[1]), float(parts[2])))
+                continue
+            if not line.startswith("f "):
+                continue
+
+            parts = line.split()[1:]
+            if len(parts) < 3:
+                continue
+            corner_indices: List[int] = []
+            for token in parts:
+                try:
+                    v_idx, vt_idx = parse_obj_face_token(token, len(raw_vertices), len(raw_texcoords))
+                except Exception:
+                    continue
+                if not (0 <= v_idx < len(raw_vertices)):
+                    continue
+                if not (0 <= vt_idx < len(raw_texcoords)):
+                    vt_idx = -1
+                if vt_idx >= 0:
+                    vt_used_any = True
+
+                key = (v_idx, vt_idx)
+                idx = remap.get(key)
+                if idx is None:
+                    idx = len(out_vertices)
+                    remap[key] = idx
+                    out_vertices.append(raw_vertices[v_idx])
+                    if vt_idx >= 0:
+                        out_texcoords.append(raw_texcoords[vt_idx])
+                    else:
+                        out_texcoords.append((0.0, 0.0))
+                corner_indices.append(idx)
+            if len(corner_indices) < 3:
+                continue
+            root = corner_indices[0]
+            for i in range(1, len(corner_indices) - 1):
+                faces.append((root, corner_indices[i], corner_indices[i + 1]))
+
+    if not out_vertices or not faces:
+        raise RuntimeError(f"Invalid OBJ mesh: {path}")
+
+    texture_path = resolve_mtl_texture(path, mtllib_entries)
+    texcoords = np.asarray(out_texcoords, dtype=np.float32) if vt_used_any else None
+    return ObjMesh(
+        vertices=np.asarray(out_vertices, dtype=np.float32),
+        faces=np.asarray(faces, dtype=np.int32),
+        texcoords=texcoords,
+        texture_path=texture_path,
+    )
+
+
+def decimate_faces_stride(faces: np.ndarray, budget: int) -> np.ndarray:
+    if budget <= 0 or faces.shape[0] <= budget:
+        return faces
+    stride = int(math.ceil(faces.shape[0] / budget))
+    return faces[::stride].astype(np.int32, copy=False)
+
+
+def compact_mesh(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    texcoords: Optional[np.ndarray] = None,
+    texture_path: Optional[Path] = None,
+    vertex_colors: Optional[np.ndarray] = None,
+) -> ObjMesh:
+    used = np.unique(faces.reshape(-1))
+    remap = np.full(vertices.shape[0], -1, dtype=np.int32)
+    remap[used] = np.arange(used.size, dtype=np.int32)
+    new_faces = remap[faces]
+    new_vertices = vertices[used]
+    new_texcoords = texcoords[used].astype(np.float32, copy=False) if texcoords is not None else None
+    new_vertex_colors = vertex_colors[used].astype(np.float32, copy=False) if vertex_colors is not None else None
+    return ObjMesh(
+        vertices=new_vertices.astype(np.float32, copy=False),
+        faces=new_faces.astype(np.int32, copy=False),
+        texcoords=new_texcoords,
+        texture_path=texture_path,
+        vertex_colors=new_vertex_colors,
+    )
+
+
+def cross_section_spread(points: np.ndarray, axis_idx: int) -> float:
+    if points.shape[0] < 8:
+        return float("inf")
+    ctr = points.mean(axis=0)
+    centered = points - ctr[None, :]
+    centered[:, axis_idx] = 0.0
+    rad = np.linalg.norm(centered, axis=1)
+    return float(np.mean(rad))
+
+
+def auto_align_racket_vertices(vertices: np.ndarray) -> np.ndarray:
+    bbox_min = np.min(vertices, axis=0)
+    bbox_max = np.max(vertices, axis=0)
+    ext = bbox_max - bbox_min
+    axis_idx = int(np.argmax(ext))
+
+    axis_vals = vertices[:, axis_idx]
+    low_thr = float(np.percentile(axis_vals, 5))
+    high_thr = float(np.percentile(axis_vals, 95))
+    low_pts = vertices[axis_vals <= low_thr]
+    high_pts = vertices[axis_vals >= high_thr]
+
+    low_spread = cross_section_spread(low_pts, axis_idx)
+    high_spread = cross_section_spread(high_pts, axis_idx)
+    butt_pts = low_pts if low_spread <= high_spread else high_pts
+    head_pts = high_pts if low_spread <= high_spread else low_pts
+
+    butt_center = butt_pts.mean(axis=0)
+    head_center = head_pts.mean(axis=0)
+    centered = vertices - butt_center[None, :]
+
+    z_model = safe_normalize(head_center - butt_center, fallback=np.array([1.0, 0.0, 0.0], dtype=np.float32))
+
+    cov = np.cov(centered.T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    y_model = eigvecs[:, int(np.argmin(eigvals))].astype(np.float32)
+    y_model = y_model - float(np.dot(y_model, z_model)) * z_model
+    y_model = safe_normalize(y_model, fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
+    x_model = safe_normalize(np.cross(y_model, z_model), fallback=np.array([0.0, 0.0, 1.0], dtype=np.float32))
+    y_model = safe_normalize(np.cross(z_model, x_model), fallback=np.array([0.0, 1.0, 0.0], dtype=np.float32))
+
+    model_basis = np.column_stack([x_model, y_model, z_model]).astype(np.float32)
+    desired_x = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+    desired_y = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+    desired_z = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    desired_basis = np.column_stack([desired_x, desired_y, desired_z]).astype(np.float32)
+
+    rot = desired_basis @ model_basis.T
+    return (rot @ centered.T).T.astype(np.float32)
+
+
+def estimate_shaft_center(vertices: np.ndarray) -> np.ndarray:
+    z = vertices[:, 2]
+    z_min = float(np.min(z))
+    z_max = float(np.max(z))
+    z_span = max(1e-6, z_max - z_min)
+
+    # Exclude extreme ends so shaft candidates dominate.
+    mid_mask = (z >= (z_min + 0.15 * z_span)) & (z <= (z_max - 0.05 * z_span))
+    if int(np.count_nonzero(mid_mask)) < 200:
+        mid_mask = np.ones(vertices.shape[0], dtype=bool)
+
+    pts = vertices[mid_mask]
+    radial = np.linalg.norm(pts[:, :2], axis=1)
+    radial_thr = float(np.percentile(radial, 35))
+    shaft_pts = pts[radial <= radial_thr]
+    if shaft_pts.shape[0] < 100:
+        keep = max(100, pts.shape[0] // 10)
+        shaft_pts = pts[np.argsort(radial)[:keep]]
+
+    center = np.mean(shaft_pts, axis=0).astype(np.float32)
+    return center
+
+
+def load_prepare_racket_mesh(
+    obj_path: Path,
+    face_budget: int,
+    align_roll: float,
+    align_pitch: float,
+    align_yaw: float,
+) -> ObjMesh:
+    mesh = load_obj_mesh(obj_path)
+    vertices_m = mesh.vertices * 0.01
+    aligned = auto_align_racket_vertices(vertices_m)
+    shaft_center = estimate_shaft_center(aligned)
+    aligned = aligned - shaft_center[None, :]
+    manual_rot = euler_deg_to_rotmat(align_roll, align_pitch, align_yaw)
+    aligned = rotate_points(aligned, manual_rot)
+    # Stride decimation breaks surface continuity for textured meshes.
+    # Keep full topology when UVs are present so texture can render correctly.
+    if mesh.texcoords is not None:
+        faces = mesh.faces
+    else:
+        faces = decimate_faces_stride(mesh.faces, face_budget)
+    compact = compact_mesh(aligned, faces, texcoords=mesh.texcoords, texture_path=mesh.texture_path)
+    return compact
+
+
+def build_wireframe_racket_sensor_frame() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     shaft_len = 0.53
     head_center_z = -0.58
     head_rx = 0.10
@@ -395,16 +753,117 @@ def build_racket_model_sensor_frame() -> Tuple[np.ndarray, np.ndarray, np.ndarra
         ]
     ).astype(np.float32)
     face_normal = np.array([[0.0, 0.0, head_center_z], [0.0, face_normal_len, head_center_z]], dtype=np.float32)
+    # Keep shaft center at origin for consistent IMU anchoring.
+    shift = np.array([0.0, 0.0, -0.5 * shaft_len], dtype=np.float32)
+    shaft = shaft - shift[None, :]
+    head = head - shift[None, :]
+    face_normal = face_normal - shift[None, :]
     return shaft, head, face_normal
 
 
-def rotate_points(points: np.ndarray, rot: np.ndarray) -> np.ndarray:
-    return (rot @ points.T).T.astype(np.float32, copy=False)
+def normalize_requested_opengl_mode(mode: str, no_opengl_flag: bool) -> str:
+    if no_opengl_flag:
+        return "none"
+    return mode
+
+
+def effective_qt_opengl_mode(requested_mode: str, retried: bool) -> str:
+    if requested_mode == "auto":
+        return "software" if retried else "desktop"
+    return requested_mode
+
+
+def configure_qt_opengl_env(qt_opengl_mode: str) -> None:
+    if qt_opengl_mode == "desktop":
+        os.environ["QT_OPENGL"] = "desktop"
+    elif qt_opengl_mode == "software":
+        os.environ["QT_OPENGL"] = "software"
+
+
+def format_opengl_error(err: Exception) -> str:
+    msg = str(err).strip()
+    low = msg.lower()
+    if "no module named 'opengl'" in low:
+        return f"{msg}. Install dependency: {OPENGL_INSTALL_HINT}"
+    return msg
+
+
+def should_retry_in_software(
+    requested_mode: str,
+    qt_mode: str,
+    already_retried: bool,
+    err: Exception,
+) -> bool:
+    if requested_mode != "auto":
+        return False
+    if qt_mode != "desktop":
+        return False
+    if already_retried:
+        return False
+
+    msg = str(err).lower()
+    if "no module named 'opengl'" in msg:
+        return False
+
+    tokens = [
+        "opengl",
+        "wgl",
+        "glviewwidget",
+        "qopengl",
+        "failed to create context",
+        "could not create",
+        "failed creating",
+    ]
+    return any(t in msg for t in tokens)
+
+
+def relaunch_with_software_opengl() -> None:
+    script = str(Path(__file__).resolve())
+    argv = sys.argv[1:]
+    new_args: List[str] = []
+    replaced_mode = False
+
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--opengl-mode":
+            replaced_mode = True
+            new_args.extend(["--opengl-mode", "software"])
+            i += 2
+            continue
+        if arg.startswith("--opengl-mode="):
+            replaced_mode = True
+            new_args.append("--opengl-mode=software")
+            i += 1
+            continue
+        if arg == "--_opengl-retried":
+            i += 1
+            continue
+        new_args.append(arg)
+        i += 1
+
+    if not replaced_mode:
+        new_args.extend(["--opengl-mode", "software"])
+    new_args.append("--_opengl-retried")
+
+    env = os.environ.copy()
+    env["QT_OPENGL"] = "software"
+    print("[UI] Relaunching with software OpenGL...")
+    os.execve(sys.executable, [sys.executable, script, *new_args], env)
+
+
+def qmatrix_from_rot3(rot: np.ndarray, QtGui):
+    m = QtGui.QMatrix4x4()
+    m.setRow(0, QtGui.QVector4D(float(rot[0, 0]), float(rot[0, 1]), float(rot[0, 2]), 0.0))
+    m.setRow(1, QtGui.QVector4D(float(rot[1, 0]), float(rot[1, 1]), float(rot[1, 2]), 0.0))
+    m.setRow(2, QtGui.QVector4D(float(rot[2, 0]), float(rot[2, 1]), float(rot[2, 2]), 0.0))
+    m.setRow(3, QtGui.QVector4D(0.0, 0.0, 0.0, 1.0))
+    return m
 
 
 def main() -> None:
     if os.name != "nt":
-        raise RuntimeError("This script is Windows-only. Please run in native Windows terminal.")
+        raise RuntimeError("This script is Windows-only. Please run it in native Windows terminal.")
 
     ap = argparse.ArgumentParser(description="Windows high-performance dual sensor parser")
     ap.add_argument("--pressure-port", default="COM8")
@@ -421,7 +880,10 @@ def main() -> None:
     ap.add_argument("--save-csv", default="")
 
     ap.add_argument("--fps", type=float, default=60.0)
-    ap.add_argument("--no-opengl", action="store_true")
+    ap.add_argument("--opengl-mode", choices=["auto", "desktop", "software", "none"], default="auto")
+    ap.add_argument("--no-opengl", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--_opengl-retried", action="store_true", help=argparse.SUPPRESS)
+
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--status-interval", type=float, default=1.0)
     ap.add_argument("--duration-sec", type=float, default=0.0)
@@ -435,7 +897,19 @@ def main() -> None:
     ap.add_argument("--vmax", type=float, default=1000.0)
     ap.add_argument("--queue-size", type=int, default=4096)
     ap.add_argument("--read-chunk", type=int, default=4096)
+
+    ap.add_argument("--racket-obj", default=str(DEFAULT_RACKET_OBJ))
+    ap.add_argument("--no-racket-obj", action="store_true")
+    ap.add_argument("--racket-face-budget", type=int, default=8000)
+    ap.add_argument("--racket-align-roll", type=float, default=0.0)
+    ap.add_argument("--racket-align-pitch", type=float, default=0.0)
+    ap.add_argument("--racket-align-yaw", type=float, default=0.0)
     args = ap.parse_args()
+
+    requested_opengl_mode = normalize_requested_opengl_mode(args.opengl_mode, args.no_opengl)
+    qt_opengl_mode = effective_qt_opengl_mode(requested_opengl_mode, args._opengl_retried)
+    if qt_opengl_mode in ("desktop", "software"):
+        configure_qt_opengl_env(qt_opengl_mode)
 
     stop_event = threading.Event()
     stats = {
@@ -456,20 +930,20 @@ def main() -> None:
     latest_pressure: Optional[PressureFrame] = None
     latest_imu: Optional[ImuFrame] = None
     imu_buffer: Deque[ImuFrame] = deque(maxlen=20000)
+
     interp_scale = max(1, args.interp_scale)
     display_hw = 16 * interp_scale
     pressure_interp_plan = build_bilinear_plan(16, 16, interp_scale)
     latest_pressure_display: Optional[np.ndarray] = None
     latest_pressure_display_ts: Optional[float] = None
 
-    # Zero calibration state.
     zero_offset = np.zeros((16, 16), dtype=np.float32)
     zero_enabled = False
     zero_calibrating = False
     zero_start_ts = 0.0
     zero_duration_sec = 5.0
     zero_samples: List[np.ndarray] = []
-    zero_status_msg = "闆剁偣锛氭湭鏍″噯"
+    zero_status_msg = UI_TEXT["zero_not_calibrated"]
 
     csv_writer = None
     csv_fp = None
@@ -488,15 +962,12 @@ def main() -> None:
 
         with lock:
             raw_vals = frame.values
-
-            # 1) Collect baseline samples while zero calibration is active.
             if zero_calibrating:
                 zero_samples.append(raw_vals.copy())
                 elapsed = time.perf_counter() - zero_start_ts
                 if elapsed >= zero_duration_sec:
                     if len(zero_samples) >= 3:
-                        stack = np.stack(zero_samples, axis=0).astype(np.float32)  # (N,16,16)
-                        # Robust per-cell baseline by trimming to 10%~90% quantile.
+                        stack = np.stack(zero_samples, axis=0).astype(np.float32)
                         p10 = np.percentile(stack, 10, axis=0)
                         p90 = np.percentile(stack, 90, axis=0)
                         valid = (stack >= p10[None, ...]) & (stack <= p90[None, ...])
@@ -504,23 +975,15 @@ def main() -> None:
                         zero_map = np.nanmean(clipped, axis=0)
                         fallback = np.mean(stack, axis=0)
                         zero_map = np.where(np.isnan(zero_map), fallback, zero_map).astype(np.float32)
-
                         zero_offset = zero_map
                         zero_enabled = True
-                        zero_status_msg = f"闆剁偣锛氬凡鏍″噯锛堟牱鏈?{len(zero_samples)} 甯э級"
+                        zero_status_msg = f"Zero calibration: calibrated ({len(zero_samples)} samples)"
                     else:
                         zero_status_msg = "Zero calibration failed (not enough samples)"
-
                     zero_calibrating = False
                     zero_samples.clear()
 
-            # 2) Apply zero-offset map for visualization/sync/CSV.
-            if zero_enabled:
-                corrected = raw_vals - zero_offset
-                corrected = np.maximum(corrected, 0.0)
-            else:
-                corrected = raw_vals
-
+            corrected = np.maximum(raw_vals - zero_offset, 0.0) if zero_enabled else raw_vals
             display_vals = pressure_for_display(
                 corrected,
                 args.transpose,
@@ -529,9 +992,11 @@ def main() -> None:
                 rotate_ccw90=(not args.no_rotate_ccw90),
                 interp_plan=pressure_interp_plan,
             )
+
             latest_pressure = PressureFrame(host_ts=frame.host_ts, values=corrected, checksum_ok=frame.checksum_ok)
             latest_pressure_display = display_vals
             latest_pressure_display_ts = frame.host_ts
+
             stats["pressure_frames"] += 1
             if not frame.checksum_ok:
                 stats["pressure_bad_checksum"] += 1
@@ -613,7 +1078,6 @@ def main() -> None:
             stats=stats,
         )
 
-    # 鍚姩绾跨▼
     pressure_ingest.start()
     pressure_parse.start()
     if imu_ingest is not None:
@@ -623,11 +1087,13 @@ def main() -> None:
 
     imu_desc = "DISABLED" if args.disable_imu else f"{args.imu_port}@{args.imu_baud}"
     print(
-        f"Running fast mode | Pressure {args.pressure_port}@{args.pressure_baud} range={args.pressure_range} "
-        f"| IMU {imu_desc} | OpenGL={not args.no_opengl}"
+        f"Running | Pressure {args.pressure_port}@{args.pressure_baud} range={args.pressure_range} "
+        f"| IMU {imu_desc} | OpenGL request={requested_opengl_mode} qt={qt_opengl_mode}"
     )
 
     start_ts = time.perf_counter()
+    request_software_relaunch = False
+    software_relaunch_reason = ""
 
     def should_stop_by_duration() -> bool:
         return args.duration_sec > 0 and (time.perf_counter() - start_ts) >= args.duration_sec
@@ -662,18 +1128,22 @@ def main() -> None:
             import pyqtgraph as pg
             from pyqtgraph.Qt import QtCore, QtWidgets
 
-            pg.setConfigOptions(antialias=False, useOpenGL=(not args.no_opengl), imageAxisOrder="row-major")
+            pg.setConfigOptions(
+                antialias=False,
+                useOpenGL=(qt_opengl_mode != "none"),
+                imageAxisOrder="row-major",
+            )
             app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
             win = QtWidgets.QWidget()
-            win.setWindowTitle("Dual Sensor SAGE (Windows High Performance)")
+            win.setWindowTitle(UI_TEXT["title"])
             vbox = QtWidgets.QVBoxLayout(win)
 
             top_row = QtWidgets.QHBoxLayout()
             vbox.addLayout(top_row, stretch=1)
 
             glw = pg.GraphicsLayoutWidget()
-            top_row.addWidget(glw, stretch=2)
+            top_row.addWidget(glw, stretch=1)
             vb = glw.addViewBox(lockAspect=True)
             vb.setMouseEnabled(x=False, y=False)
             img = pg.ImageItem()
@@ -686,8 +1156,12 @@ def main() -> None:
 
             imu3d_enabled = False
             imu3d_error_msg = ""
+            imu3d_source = "none"
             imu_init_rot_world: Optional[np.ndarray] = None
             last_drawn_imu_ts: Optional[float] = None
+            last_drawn_pressure_ts: Optional[float] = None
+            imu_zero_status_msg = "IMU zero: waiting first frame"
+
             sensor0_to_view = np.array(
                 [
                     [1.0, 0.0, 0.0],
@@ -696,75 +1170,133 @@ def main() -> None:
                 ],
                 dtype=np.float32,
             )
-            racket_shaft_sensor, racket_head_sensor, racket_face_sensor = build_racket_model_sensor_frame()
-            racket_shaft_item = None
-            racket_head_item = None
-            racket_face_item = None
 
-            if not args.disable_imu:
+            wire_shaft_sensor, wire_head_sensor, wire_face_sensor = build_wireframe_racket_sensor_frame()
+            wire_shaft_item = None
+            wire_head_item = None
+            wire_face_item = None
+            racket_mesh_item = None
+            QtGui = None
+
+            if (not args.disable_imu) and (qt_opengl_mode != "none"):
                 try:
                     import pyqtgraph.opengl as gl
+                    from pyqtgraph.Qt import QtGui as _QtGui
+
+                    QtGui = _QtGui
+                    try:
+                        import OpenGL.GL  # noqa: F401
+                    except Exception as dep_err:
+                        raise RuntimeError(format_opengl_error(dep_err)) from dep_err
 
                     imu3d_enabled = True
                     imu_view = gl.GLViewWidget()
-                    imu_view.setMinimumWidth(420)
+                    try:
+                        imu_view.setBackgroundColor((255, 255, 255, 255))
+                    except Exception:
+                        pass
                     imu_view.opts["distance"] = 2.0
                     imu_view.opts["elevation"] = 18.0
                     imu_view.opts["azimuth"] = -40.0
                     top_row.addWidget(imu_view, stretch=1)
 
-                    grid = gl.GLGridItem()
-                    grid.scale(0.25, 0.25, 0.25)
-                    imu_view.addItem(grid)
-
                     axis = gl.GLAxisItem()
                     axis.setSize(0.25, 0.25, 0.25)
                     imu_view.addItem(axis)
 
-                    racket_shaft_item = gl.GLLinePlotItem(
-                        pos=rotate_points(racket_shaft_sensor, sensor0_to_view),
-                        color=(1.0, 0.9, 0.2, 1.0),
-                        width=4.0,
-                        antialias=(not args.no_opengl),
-                        mode="line_strip",
-                    )
-                    racket_head_item = gl.GLLinePlotItem(
-                        pos=rotate_points(racket_head_sensor, sensor0_to_view),
-                        color=(0.1, 0.8, 1.0, 1.0),
-                        width=2.0,
-                        antialias=(not args.no_opengl),
-                        mode="line_strip",
-                    )
-                    racket_face_item = gl.GLLinePlotItem(
-                        pos=rotate_points(racket_face_sensor, sensor0_to_view),
-                        color=(1.0, 0.3, 0.3, 1.0),
-                        width=2.0,
-                        antialias=(not args.no_opengl),
-                        mode="line_strip",
-                    )
-                    imu_view.addItem(racket_shaft_item)
-                    imu_view.addItem(racket_head_item)
-                    imu_view.addItem(racket_face_item)
+                    if not args.no_racket_obj:
+                        obj_path = Path(args.racket_obj)
+                        try:
+                            mesh = load_prepare_racket_mesh(
+                                obj_path=obj_path,
+                                face_budget=max(100, args.racket_face_budget),
+                                align_roll=args.racket_align_roll,
+                                align_pitch=args.racket_align_pitch,
+                                align_yaw=args.racket_align_yaw,
+                            )
+                            if mesh.texture_path is not None and mesh.texcoords is not None:
+                                vcolors = sample_vertex_colors_from_texture(mesh.texcoords, mesh.texture_path, QtGui)
+                                if vcolors is not None:
+                                    mesh.vertex_colors = vcolors
+
+                            mesh_kwargs = {
+                                "vertexes": mesh.vertices,
+                                "faces": mesh.faces,
+                                "smooth": False,
+                                "drawEdges": False,
+                                "drawFaces": True,
+                                "shader": "shaded",
+                            }
+                            if mesh.vertex_colors is not None:
+                                # Use direct vertex colors for texture preview; avoid lighting darkening.
+                                mesh_kwargs["vertexColors"] = mesh.vertex_colors
+                                mesh_kwargs["smooth"] = True
+                                mesh_kwargs["shader"] = None
+                            else:
+                                mesh_kwargs["color"] = (0.87, 0.87, 0.92, 1.0)
+
+                            racket_mesh_item = gl.GLMeshItem(**mesh_kwargs)
+                            imu_view.addItem(racket_mesh_item)
+                            if mesh.vertex_colors is not None and mesh.texture_path is not None:
+                                imu3d_source = f"obj:{obj_path.name} tex:{mesh.texture_path.name} faces={mesh.faces.shape[0]}"
+                            else:
+                                imu3d_source = f"obj:{obj_path.name} faces={mesh.faces.shape[0]}"
+                        except Exception as mesh_err:
+                            imu3d_error_msg = f"OBJ fallback: {mesh_err}"
+
+                    if racket_mesh_item is None:
+                        wire_shaft_item = gl.GLLinePlotItem(
+                            pos=rotate_points(wire_shaft_sensor, sensor0_to_view),
+                            color=(1.0, 0.9, 0.2, 1.0),
+                            width=4.0,
+                            antialias=True,
+                            mode="line_strip",
+                        )
+                        wire_head_item = gl.GLLinePlotItem(
+                            pos=rotate_points(wire_head_sensor, sensor0_to_view),
+                            color=(0.1, 0.8, 1.0, 1.0),
+                            width=2.0,
+                            antialias=True,
+                            mode="line_strip",
+                        )
+                        wire_face_item = gl.GLLinePlotItem(
+                            pos=rotate_points(wire_face_sensor, sensor0_to_view),
+                            color=(1.0, 0.3, 0.3, 1.0),
+                            width=2.0,
+                            antialias=True,
+                            mode="line_strip",
+                        )
+                        imu_view.addItem(wire_shaft_item)
+                        imu_view.addItem(wire_head_item)
+                        imu_view.addItem(wire_face_item)
+                        if imu3d_source == "none":
+                            imu3d_source = "wireframe"
                 except Exception as e:
-                    imu3d_error_msg = str(e)
+                    if should_retry_in_software(requested_opengl_mode, qt_opengl_mode, args._opengl_retried, e):
+                        raise OpenGLAutoRetryRequested(str(e)) from e
+                    imu3d_enabled = False
+                    imu3d_error_msg = format_opengl_error(e)
 
             if (not args.disable_imu) and (not imu3d_enabled):
-                imu_warn = QtWidgets.QLabel("IMU 3D unavailable:\n" + (imu3d_error_msg or "OpenGL backend not available"))
+                if qt_opengl_mode == "none":
+                    imu3d_error_msg = "disabled by --opengl-mode none"
+                elif not imu3d_error_msg:
+                    imu3d_error_msg = f"OpenGL backend unavailable. Install dependency: {OPENGL_INSTALL_HINT}"
+                imu_warn = QtWidgets.QLabel(f"{UI_TEXT['imu3d_unavailable_prefix']}\n{imu3d_error_msg}")
                 imu_warn.setWordWrap(True)
                 imu_warn.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
                 top_row.addWidget(imu_warn, stretch=1)
 
-            lbl = QtWidgets.QLabel("Waiting data...")
+            lbl = QtWidgets.QLabel(UI_TEXT["waiting"])
             lbl.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
             vbox.addWidget(lbl)
 
-            # 浜や簰鎸夐挳锛氶浂鐐规牎鍑?/ 娑堥櫎闆剁偣
             btn_row = QtWidgets.QHBoxLayout()
-            btn_zero_calib = QtWidgets.QPushButton("闆剁偣鏍″噯")
-            btn_zero_clear = QtWidgets.QPushButton("娑堥櫎闆剁偣")
+            btn_zero_calib = QtWidgets.QPushButton(UI_TEXT["zero_btn_start"])
+            btn_zero_clear = QtWidgets.QPushButton(UI_TEXT["zero_btn_clear"])
+            btn_imu_reset = QtWidgets.QPushButton(UI_TEXT["imu_btn_reset"])
             btn_row.addWidget(btn_zero_calib)
             btn_row.addWidget(btn_zero_clear)
-            btn_imu_reset = QtWidgets.QPushButton("Reset IMU Zero")
             btn_row.addWidget(btn_imu_reset)
             btn_row.addStretch(1)
             vbox.addLayout(btn_row)
@@ -775,8 +1307,6 @@ def main() -> None:
                 timer.setTimerType(QtCore.Qt.PreciseTimer)
             except Exception:
                 pass
-            last_drawn_pressure_ts: Optional[float] = None
-            imu_zero_status_msg = "IMU zero: waiting first frame"
 
             def start_zero_calibration():
                 nonlocal zero_enabled, zero_calibrating, zero_start_ts, zero_samples, zero_status_msg
@@ -785,7 +1315,7 @@ def main() -> None:
                     zero_calibrating = True
                     zero_start_ts = time.perf_counter()
                     zero_samples = []
-                    zero_status_msg = "Zero calibration running (5.0s)"
+                    zero_status_msg = f"{UI_TEXT['zero_running']} (5.0s)"
                 print("[PRESSURE] Zero calibration started (5s)")
 
             def clear_zero_calibration():
@@ -795,7 +1325,7 @@ def main() -> None:
                     zero_calibrating = False
                     zero_samples.clear()
                     zero_offset = np.zeros((16, 16), dtype=np.float32)
-                    zero_status_msg = "闆剁偣锛氬凡娓呴櫎"
+                    zero_status_msg = UI_TEXT["zero_cleared"]
                 print("[PRESSURE] Zero calibration cleared")
 
             def reset_imu_zero_pose():
@@ -835,16 +1365,20 @@ def main() -> None:
                     rot_sw = imu_rot_sensor_to_world(i.quat_wxyz, args.imu_quat_world_to_sensor)
                     if imu_init_rot_world is None:
                         imu_init_rot_world = rot_sw
-                        imu_zero_status_msg = 'IMU zero: locked'
+                        imu_zero_status_msg = "IMU zero: locked"
                     rot_rel = imu_init_rot_world.T @ rot_sw
                     rot_view = sensor0_to_view @ rot_rel
 
-                    if racket_shaft_item is not None:
-                        racket_shaft_item.setData(pos=rotate_points(racket_shaft_sensor, rot_view))
-                    if racket_head_item is not None:
-                        racket_head_item.setData(pos=rotate_points(racket_head_sensor, rot_view))
-                    if racket_face_item is not None:
-                        racket_face_item.setData(pos=rotate_points(racket_face_sensor, rot_view))
+                    if racket_mesh_item is not None and QtGui is not None:
+                        transform = qmatrix_from_rot3(rot_view, QtGui)
+                        racket_mesh_item.setTransform(transform)
+                    else:
+                        if wire_shaft_item is not None:
+                            wire_shaft_item.setData(pos=rotate_points(wire_shaft_sensor, rot_view))
+                        if wire_head_item is not None:
+                            wire_head_item.setData(pos=rotate_points(wire_head_sensor, rot_view))
+                        if wire_face_item is not None:
+                            wire_face_item.setData(pos=rotate_points(wire_face_sensor, rot_view))
                     last_drawn_imu_ts = i.host_ts
 
                 elapsed = max(1e-6, time.perf_counter() - start_ts)
@@ -852,18 +1386,19 @@ def main() -> None:
                     f"P={st['pressure_frames']} ({st['pressure_frames']/elapsed:.1f} fps) parsed={st['pressure_parsed_frames']} drop={st['pressure_drop_chunks']}",
                     f"IMU={st['imu_frames']} ({st['imu_frames']/elapsed:.1f} fps) parsed={st['imu_parsed_frames']} drop={st['imu_drop_chunks']}",
                     f"sync={st['synced']}/{st['unsynced']}",
+                    f"OpenGL request={requested_opengl_mode} qt={qt_opengl_mode}",
                 ]
                 if z_calib:
                     lines.append(f"{z_status} | remain {z_remaining:0.1f}s | samples {z_samples_n}")
                 else:
-                    lines.append(f"{z_status} | {'enabled' if z_enabled else 'disabled'}")
+                    lines.append(f"{z_status} | {UI_TEXT['zero_enabled'] if z_enabled else UI_TEXT['zero_disabled']}")
 
                 if args.disable_imu:
-                    lines.append('IMU 3D: disabled')
+                    lines.append("IMU 3D: disabled")
                 elif imu3d_enabled:
-                    lines.append(f"IMU 3D: on | {imu_zero_status_msg}")
+                    lines.append(f"IMU 3D: on | {imu_zero_status_msg} | source={imu3d_source}")
                 else:
-                    err_short = imu3d_error_msg.splitlines()[0] if imu3d_error_msg else 'OpenGL backend not available'
+                    err_short = imu3d_error_msg.splitlines()[0] if imu3d_error_msg else "OpenGL backend unavailable"
                     lines.append(f"IMU 3D: unavailable ({err_short})")
 
                 if p is not None:
@@ -878,12 +1413,15 @@ def main() -> None:
                 btn_zero_clear.setEnabled(z_calib or z_enabled)
                 btn_imu_reset.setEnabled((not args.disable_imu) and imu3d_enabled)
                 lbl.setText("\n".join(lines))
+
             timer.timeout.connect(tick)
             timer.start()
-            win.resize(1100, 760)
+            win.resize(1260, 780)
             win.show()
             app.exec()
-
+    except OpenGLAutoRetryRequested as e:
+        request_software_relaunch = True
+        software_relaunch_reason = str(e)
     except KeyboardInterrupt:
         pass
     finally:
@@ -898,7 +1436,10 @@ def main() -> None:
             csv_fp.close()
         print("Stopped")
 
+    if request_software_relaunch:
+        print(f"[UI] Desktop OpenGL failed, retrying with software backend: {software_relaunch_reason}")
+        relaunch_with_software_opengl()
+
 
 if __name__ == "__main__":
     main()
-
