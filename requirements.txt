@@ -1,0 +1,16 @@
+# Required dependencies for run_dual_sensor_sage.py
+
+# Core numerical computing
+numpy>=1.20.0
+
+# Serial communication (M1616M pressure sensor, TB100 IMU)
+pyserial>=3.5
+
+# GUI and visualization
+pyqtgraph>=0.13.0
+PyQt5>=5.15.0
+
+# Optional: OpenGL for 3D visualization (required for IMU 3D view)
+# Uncomment if you need 3D racket model rendering
+# PyOpenGL>=3.1.6
+# PyOpenGL_accelerate>=3.1.3
