@@ -655,10 +655,26 @@ def auto_align_racket_vertices(vertices: np.ndarray) -> np.ndarray:
     axis_idx = int(np.argmax(ext))
 
     axis_vals = vertices[:, axis_idx]
-    low_thr = float(np.percentile(axis_vals, 5))
-    high_thr = float(np.percentile(axis_vals, 95))
+    axis_min = float(np.min(axis_vals))
+    axis_max = float(np.max(axis_vals))
+    axis_span = max(1e-6, axis_max - axis_min)
+    edge_ratio = 0.08
+    low_thr = axis_min + edge_ratio * axis_span
+    high_thr = axis_max - edge_ratio * axis_span
     low_pts = vertices[axis_vals <= low_thr]
     high_pts = vertices[axis_vals >= high_thr]
+    if (low_pts.shape[0] < 32) or (high_pts.shape[0] < 32):
+        edge_ratio = 0.12
+        low_thr = axis_min + edge_ratio * axis_span
+        high_thr = axis_max - edge_ratio * axis_span
+        low_pts = vertices[axis_vals <= low_thr]
+        high_pts = vertices[axis_vals >= high_thr]
+    if (low_pts.shape[0] < 8) or (high_pts.shape[0] < 8):
+        # Fallback for very sparse meshes.
+        low_thr = float(np.percentile(axis_vals, 5))
+        high_thr = float(np.percentile(axis_vals, 95))
+        low_pts = vertices[axis_vals <= low_thr]
+        high_pts = vertices[axis_vals >= high_thr]
 
     low_spread = cross_section_spread(low_pts, axis_idx)
     high_spread = cross_section_spread(high_pts, axis_idx)
@@ -689,27 +705,27 @@ def auto_align_racket_vertices(vertices: np.ndarray) -> np.ndarray:
     return (rot @ centered.T).T.astype(np.float32)
 
 
-def estimate_shaft_center(vertices: np.ndarray) -> np.ndarray:
+def estimate_handle_center(vertices: np.ndarray) -> np.ndarray:
     z = vertices[:, 2]
     z_min = float(np.min(z))
     z_max = float(np.max(z))
     z_span = max(1e-6, z_max - z_min)
 
-    # Exclude extreme ends so shaft candidates dominate.
-    mid_mask = (z >= (z_min + 0.15 * z_span)) & (z <= (z_max - 0.05 * z_span))
-    if int(np.count_nonzero(mid_mask)) < 200:
-        mid_mask = np.ones(vertices.shape[0], dtype=bool)
+    # Use butt-side slice to stabilize x/y center for the grip area.
+    butt_slice = z >= (z_max - 0.10 * z_span)
+    if int(np.count_nonzero(butt_slice)) < 100:
+        butt_slice = z >= (z_max - 0.18 * z_span)
+    if int(np.count_nonzero(butt_slice)) < 20:
+        butt_slice = np.ones(vertices.shape[0], dtype=bool)
+    butt_pts = vertices[butt_slice]
+    center_xy = np.mean(butt_pts[:, :2], axis=0).astype(np.float32)
 
-    pts = vertices[mid_mask]
-    radial = np.linalg.norm(pts[:, :2], axis=1)
-    radial_thr = float(np.percentile(radial, 35))
-    shaft_pts = pts[radial <= radial_thr]
-    if shaft_pts.shape[0] < 100:
-        keep = max(100, pts.shape[0] // 10)
-        shaft_pts = pts[np.argsort(radial)[:keep]]
-
-    center = np.mean(shaft_pts, axis=0).astype(np.float32)
-    return center
+    # Place origin inside the handle instead of the butt end.
+    # 9 cm is a typical badminton grip-center depth; for short models
+    # clamp by ratio to avoid overshooting.
+    handle_depth = min(0.09, 0.18 * z_span)
+    handle_center_z = z_max - handle_depth
+    return np.array([center_xy[0], center_xy[1], handle_center_z], dtype=np.float32)
 
 
 def load_prepare_racket_mesh(
@@ -722,8 +738,8 @@ def load_prepare_racket_mesh(
     mesh = load_obj_mesh(obj_path)
     vertices_m = mesh.vertices * 0.01
     aligned = auto_align_racket_vertices(vertices_m)
-    shaft_center = estimate_shaft_center(aligned)
-    aligned = aligned - shaft_center[None, :]
+    handle_center = estimate_handle_center(aligned)
+    aligned = aligned - handle_center[None, :]
     manual_rot = euler_deg_to_rotmat(align_roll, align_pitch, align_yaw)
     aligned = rotate_points(aligned, manual_rot)
     # Stride decimation breaks surface continuity for textured meshes.
@@ -753,8 +769,9 @@ def build_wireframe_racket_sensor_frame() -> Tuple[np.ndarray, np.ndarray, np.nd
         ]
     ).astype(np.float32)
     face_normal = np.array([[0.0, 0.0, head_center_z], [0.0, face_normal_len, head_center_z]], dtype=np.float32)
-    # Keep shaft center at origin for consistent IMU anchoring.
-    shift = np.array([0.0, 0.0, -0.5 * shaft_len], dtype=np.float32)
+    # Keep handle center at origin for consistent IMU anchoring.
+    handle_center_from_butt = 0.17 * shaft_len
+    shift = np.array([0.0, 0.0, -handle_center_from_butt], dtype=np.float32)
     shaft = shaft - shift[None, :]
     head = head - shift[None, :]
     face_normal = face_normal - shift[None, :]
@@ -866,12 +883,12 @@ def main() -> None:
         raise RuntimeError("This script is Windows-only. Please run it in native Windows terminal.")
 
     ap = argparse.ArgumentParser(description="Windows high-performance dual sensor parser")
-    ap.add_argument("--pressure-port", default="COM8")
+    ap.add_argument("--pressure-port", default="COM3")
     ap.add_argument("--pressure-baud", type=int, default=115200)
     ap.add_argument("--pressure-range", default="1kg", choices=["1kg", "3kg", "5kg", "10kg", "20kg", "30kg", "50kg", "skip"])
     ap.add_argument("--pressure-cmd-suffix", default="cr", choices=["none", "cr", "lf", "crlf"])
 
-    ap.add_argument("--imu-port", default="COM4")
+    ap.add_argument("--imu-port", default="COM5")
     ap.add_argument("--imu-baud", type=int, default=115200)
     ap.add_argument("--disable-imu", action="store_true")
     ap.add_argument("--imu-quat-world-to-sensor", action="store_true")
