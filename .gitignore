@@ -2,3 +2,11 @@
 M1616M RX资料包/
 .deps_pyserial/
 __pycache__/
+*.pt
+*.xml
+*.png
+*.jpg
+*.mbx
+*.uni
+*.npz
+*.mvn

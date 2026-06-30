@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Deque, List, Optional, Tuple
 
@@ -58,6 +59,7 @@ class PressureFrame:
     host_ts: float
     values: np.ndarray
     checksum_ok: bool
+    csv_values: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -69,6 +71,19 @@ class ImuFrame:
     acc_g: Tuple[float, float, float]
     crc_ok: bool
     simple_sum_ok: bool
+
+
+@dataclass
+class CorrectedImuFrame:
+    host_ts: float
+    device_ts_us: int
+    qos: int
+    quat_human_wxyz: Tuple[float, float, float, float]
+    acc_human_g: Tuple[float, float, float]
+    rot_human: np.ndarray
+    crc_ok: bool
+    simple_sum_ok: bool
+    zero_seq: int
 
 
 @dataclass
@@ -140,12 +155,8 @@ class M1616MParser:
 
             frame = bytes(self.buf[: self.FRAME_LEN])
             ok = (sum(frame[:515]) & 0xFF) == frame[515]
-            if not ok:
-                del self.buf[:1]
-                continue
-
             vals = np.frombuffer(frame[3:515], dtype=">u2").astype(np.float32).reshape(16, 16)
-            out.append(PressureFrame(host_ts=host_ts, values=vals, checksum_ok=True))
+            out.append(PressureFrame(host_ts=host_ts, values=vals, checksum_ok=ok))
             del self.buf[: self.FRAME_LEN]
 
         return out
@@ -324,6 +335,13 @@ def nearest_imu(ts: float, imu_buf: Deque[ImuFrame], max_dt_sec: float) -> Optio
     return best if abs(best.host_ts - ts) <= max_dt_sec else None
 
 
+def nearest_pressure(ts: float, pressure_buf: Deque[PressureFrame], max_dt_sec: float) -> Optional[PressureFrame]:
+    if not pressure_buf:
+        return None
+    best = min(pressure_buf, key=lambda x: abs(x.host_ts - ts))
+    return best if abs(best.host_ts - ts) <= max_dt_sec else None
+
+
 def orient_pressure(mat: np.ndarray, transpose: bool, flipud: bool, fliplr: bool) -> np.ndarray:
     out = mat
     if transpose:
@@ -375,6 +393,19 @@ def pressure_for_display(
     return out
 
 
+def pressure_for_csv(
+    mat: np.ndarray,
+    transpose: bool,
+    flipud: bool,
+    fliplr: bool,
+    rotate_ccw90: bool,
+) -> np.ndarray:
+    out = orient_pressure(mat, transpose, flipud, fliplr)
+    if rotate_ccw90:
+        out = np.rot90(out, k=1)
+    return out
+
+
 def quat_wxyz_to_rotmat(quat_wxyz: Tuple[float, float, float, float]) -> np.ndarray:
     w, x, y, z = quat_wxyz
     n = float(np.sqrt(w * w + x * x + y * y + z * z))
@@ -392,6 +423,37 @@ def quat_wxyz_to_rotmat(quat_wxyz: Tuple[float, float, float, float]) -> np.ndar
         ],
         dtype=np.float32,
     )
+
+
+def rotmat_to_quat_wxyz(rot: np.ndarray) -> Tuple[float, float, float, float]:
+    trace = float(rot[0, 0] + rot[1, 1] + rot[2, 2])
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = float(rot[2, 1] - rot[1, 2]) / s
+        y = float(rot[0, 2] - rot[2, 0]) / s
+        z = float(rot[1, 0] - rot[0, 1]) / s
+    elif rot[0, 0] > rot[1, 1] and rot[0, 0] > rot[2, 2]:
+        s = math.sqrt(1.0 + float(rot[0, 0]) - float(rot[1, 1]) - float(rot[2, 2])) * 2.0
+        w = float(rot[2, 1] - rot[1, 2]) / s
+        x = 0.25 * s
+        y = float(rot[0, 1] + rot[1, 0]) / s
+        z = float(rot[0, 2] + rot[2, 0]) / s
+    elif rot[1, 1] > rot[2, 2]:
+        s = math.sqrt(1.0 + float(rot[1, 1]) - float(rot[0, 0]) - float(rot[2, 2])) * 2.0
+        w = float(rot[0, 2] - rot[2, 0]) / s
+        x = float(rot[0, 1] + rot[1, 0]) / s
+        y = 0.25 * s
+        z = float(rot[1, 2] + rot[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + float(rot[2, 2]) - float(rot[0, 0]) - float(rot[1, 1])) * 2.0
+        w = float(rot[1, 0] - rot[0, 1]) / s
+        x = float(rot[0, 2] + rot[2, 0]) / s
+        y = float(rot[1, 2] + rot[2, 1]) / s
+        z = 0.25 * s
+    quat = np.array([w, x, y, z], dtype=np.float32)
+    quat /= max(1e-12, float(np.linalg.norm(quat)))
+    return float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
 
 
 def imu_rot_sensor_to_world(quat_wxyz: Tuple[float, float, float, float], quat_world_to_sensor: bool) -> np.ndarray:
@@ -769,6 +831,8 @@ def build_wireframe_racket_sensor_frame() -> Tuple[np.ndarray, np.ndarray, np.nd
         ]
     ).astype(np.float32)
     face_normal = np.array([[0.0, 0.0, head_center_z], [0.0, face_normal_len, head_center_z]], dtype=np.float32)
+    # Sensor frame convention for the racket:
+    # +Z points from head to butt, and the XOZ plane is parallel to the string bed.
     # Keep handle center at origin for consistent IMU anchoring.
     handle_center_from_butt = 0.17 * shaft_len
     shift = np.array([0.0, 0.0, -handle_center_from_butt], dtype=np.float32)
@@ -776,6 +840,11 @@ def build_wireframe_racket_sensor_frame() -> Tuple[np.ndarray, np.ndarray, np.nd
     head = head - shift[None, :]
     face_normal = face_normal - shift[None, :]
     return shaft, head, face_normal
+
+
+def build_racket_init_to_human_rot() -> np.ndarray:
+    # At initialization the racket local frame is rotated +90 deg about the human Y axis.
+    return euler_deg_to_rotmat(0.0, 90.0, 0.0)
 
 
 def normalize_requested_opengl_mode(mode: str, no_opengl_flag: bool) -> str:
@@ -883,18 +952,18 @@ def main() -> None:
         raise RuntimeError("This script is Windows-only. Please run it in native Windows terminal.")
 
     ap = argparse.ArgumentParser(description="Windows high-performance dual sensor parser")
-    ap.add_argument("--pressure-port", default="COM3")
+    ap.add_argument("--pressure-port", default="COM8")
     ap.add_argument("--pressure-baud", type=int, default=115200)
     ap.add_argument("--pressure-range", default="1kg", choices=["1kg", "3kg", "5kg", "10kg", "20kg", "30kg", "50kg", "skip"])
     ap.add_argument("--pressure-cmd-suffix", default="cr", choices=["none", "cr", "lf", "crlf"])
 
-    ap.add_argument("--imu-port", default="COM5")
+    ap.add_argument("--imu-port", default="COM4")
     ap.add_argument("--imu-baud", type=int, default=115200)
     ap.add_argument("--disable-imu", action="store_true")
     ap.add_argument("--imu-quat-world-to-sensor", action="store_true")
 
     ap.add_argument("--sync-max-dt-ms", type=float, default=200.0)
-    ap.add_argument("--save-csv", default="")
+    ap.add_argument("--save-csv", default="output")
 
     ap.add_argument("--fps", type=float, default=60.0)
     ap.add_argument("--opengl-mode", choices=["auto", "desktop", "software", "none"], default="auto")
@@ -945,8 +1014,9 @@ def main() -> None:
 
     lock = threading.Lock()
     latest_pressure: Optional[PressureFrame] = None
-    latest_imu: Optional[ImuFrame] = None
-    imu_buffer: Deque[ImuFrame] = deque(maxlen=20000)
+    latest_imu: Optional[CorrectedImuFrame] = None
+    pressure_valid_buffer: Deque[PressureFrame] = deque(maxlen=20000)
+    sync_pending_imu: Deque[CorrectedImuFrame] = deque()
 
     interp_scale = max(1, args.interp_scale)
     display_hw = 16 * interp_scale
@@ -956,26 +1026,131 @@ def main() -> None:
 
     zero_offset = np.zeros((16, 16), dtype=np.float32)
     zero_enabled = False
-    zero_calibrating = False
-    zero_start_ts = 0.0
-    zero_duration_sec = 5.0
+    zero_calibrating = True
+    zero_start_ts = time.perf_counter()
+    zero_duration_sec = 3.0
     zero_samples: List[np.ndarray] = []
-    zero_status_msg = UI_TEXT["zero_not_calibrated"]
+    zero_status_msg = f"{UI_TEXT['zero_running']} (startup 3.0s)"
+    recording_enabled = False
+    startup_zero_pending = True
+    imu_init_rot_world: Optional[np.ndarray] = None
+    imu_zero_status_msg = "IMU zero: waiting first frame"
+    imu_zero_seq = 0
 
-    csv_writer = None
-    csv_fp = None
+    racket_init_to_human = build_racket_init_to_human_rot()
+    human0_to_view = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    csv_dir: Optional[Path] = None
+    csv_files: List = []
+    pressure_csv_writer = None
+    imu_csv_writer = None
+    sync_csv_writer = None
+    pressure_header = ["pressure_host_ts", "pressure_checksum_ok"] + [f"p_{i}" for i in range(256)]
+    imu_header = [
+        "imu_host_ts",
+        "imu_device_ts_us",
+        "imu_qos",
+        "imu_crc_ok",
+        "imu_simple_ok",
+        "imu_zero_seq",
+        "imu_ax_g",
+        "imu_ay_g",
+        "imu_az_g",
+        "imu_qw",
+        "imu_qx",
+        "imu_qy",
+        "imu_qz",
+    ]
+    sync_header = imu_header + ["pressure_matched", "pressure_host_ts", "sync_lag_ms", "pressure_checksum_ok"] + [
+        f"p_{i}" for i in range(256)
+    ]
     if args.save_csv:
-        out = Path(args.save_csv)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        csv_fp = out.open("w", newline="", encoding="utf-8")
-        csv_writer = csv.writer(csv_fp)
-        header = ["host_ts", "sync_lag_ms", "pressure_checksum_ok"] + [f"p_{i}" for i in range(256)]
-        header += ["imu_ok", "imu_crc_ok", "imu_simple_ok", "imu_ax_g", "imu_ay_g", "imu_az_g", "imu_qw", "imu_qx", "imu_qy", "imu_qz"]
-        csv_writer.writerow(header)
+        out_root = Path(args.save_csv)
+        out_root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_dir = out_root / stamp
+        suffix = 1
+        while csv_dir.exists():
+            csv_dir = out_root / f"{stamp}_{suffix:02d}"
+            suffix += 1
+        csv_dir.mkdir(parents=True, exist_ok=False)
+        pressure_fp = (csv_dir / "pressure.csv").open("w", newline="", encoding="utf-8")
+        imu_fp = (csv_dir / "imu.csv").open("w", newline="", encoding="utf-8")
+        sync_fp = (csv_dir / "sync.csv").open("w", newline="", encoding="utf-8")
+        csv_files.extend([pressure_fp, imu_fp, sync_fp])
+        pressure_csv_writer = csv.writer(pressure_fp)
+        imu_csv_writer = csv.writer(imu_fp)
+        sync_csv_writer = csv.writer(sync_fp)
+        pressure_csv_writer.writerow(pressure_header)
+        imu_csv_writer.writerow(imu_header)
+        sync_csv_writer.writerow(sync_header)
+        print(f"[CSV] Writing folder: {csv_dir}")
+
+    def build_imu_row(frame: CorrectedImuFrame) -> List[object]:
+        qw, qx, qy, qz = frame.quat_human_wxyz
+        ax, ay, az = frame.acc_human_g
+        return [
+            frame.host_ts,
+            frame.device_ts_us,
+            frame.qos,
+            int(frame.crc_ok),
+            int(frame.simple_sum_ok),
+            frame.zero_seq,
+            ax,
+            ay,
+            az,
+            qw,
+            qx,
+            qy,
+            qz,
+        ]
+
+    def build_pressure_cells(frame: Optional[PressureFrame]) -> List[object]:
+        if frame is None or frame.csv_values is None:
+            return [""] * 256
+        return frame.csv_values.reshape(-1).tolist()
+
+    def flush_sync_rows(current_host_ts: float, force: bool = False) -> None:
+        cutoff_ts = float("inf") if force else (current_host_ts - args.sync_max_dt_ms / 1000.0)
+        while sync_pending_imu and (force or sync_pending_imu[0].host_ts <= cutoff_ts):
+            imu_frame = sync_pending_imu.popleft()
+            pressure_frame = nearest_pressure(imu_frame.host_ts, pressure_valid_buffer, args.sync_max_dt_ms / 1000.0)
+            if pressure_frame is None:
+                stats["unsynced"] += 1
+            else:
+                stats["synced"] += 1
+            if sync_csv_writer is not None:
+                lag_ms = (pressure_frame.host_ts - imu_frame.host_ts) * 1000.0 if pressure_frame is not None else float("nan")
+                row = build_imu_row(imu_frame)
+                row += [
+                    int(pressure_frame is not None),
+                    pressure_frame.host_ts if pressure_frame is not None else "",
+                    lag_ms,
+                    int(pressure_frame.checksum_ok) if pressure_frame is not None else "",
+                ]
+                row += build_pressure_cells(pressure_frame)
+                sync_csv_writer.writerow(row)
+
+        if force:
+            min_keep_ts = float("inf")
+        elif sync_pending_imu:
+            min_keep_ts = sync_pending_imu[0].host_ts - args.sync_max_dt_ms / 1000.0
+        else:
+            min_keep_ts = current_host_ts - args.sync_max_dt_ms / 1000.0
+        while pressure_valid_buffer and pressure_valid_buffer[0].host_ts < min_keep_ts:
+            pressure_valid_buffer.popleft()
 
     def on_pressure(frame: PressureFrame):
         nonlocal latest_pressure, latest_pressure_display, latest_pressure_display_ts
         nonlocal zero_enabled, zero_calibrating, zero_start_ts, zero_samples, zero_offset, zero_status_msg
+        nonlocal recording_enabled, startup_zero_pending
 
         with lock:
             raw_vals = frame.values
@@ -997,10 +1172,25 @@ def main() -> None:
                         zero_status_msg = f"Zero calibration: calibrated ({len(zero_samples)} samples)"
                     else:
                         zero_status_msg = "Zero calibration failed (not enough samples)"
+                        zero_offset = np.zeros((16, 16), dtype=np.float32)
+                        zero_enabled = False
                     zero_calibrating = False
                     zero_samples.clear()
+                    if startup_zero_pending:
+                        pressure_valid_buffer.clear()
+                        sync_pending_imu.clear()
+                        recording_enabled = True
+                        startup_zero_pending = False
+                        print("[PRESSURE] Startup zero calibration completed; recording enabled")
 
             corrected = np.maximum(raw_vals - zero_offset, 0.0) if zero_enabled else raw_vals
+            csv_vals = pressure_for_csv(
+                corrected,
+                args.transpose,
+                args.flipud,
+                args.fliplr,
+                rotate_ccw90=(not args.no_rotate_ccw90),
+            )
             display_vals = pressure_for_display(
                 corrected,
                 args.transpose,
@@ -1009,43 +1199,62 @@ def main() -> None:
                 rotate_ccw90=(not args.no_rotate_ccw90),
                 interp_plan=pressure_interp_plan,
             )
-
-            latest_pressure = PressureFrame(host_ts=frame.host_ts, values=corrected, checksum_ok=frame.checksum_ok)
+            pressure_record = PressureFrame(
+                host_ts=frame.host_ts,
+                values=corrected,
+                checksum_ok=frame.checksum_ok,
+                csv_values=csv_vals,
+            )
+            latest_pressure = pressure_record
             latest_pressure_display = display_vals
             latest_pressure_display_ts = frame.host_ts
 
             stats["pressure_frames"] += 1
             if not frame.checksum_ok:
                 stats["pressure_bad_checksum"] += 1
-
-            imu = None if args.disable_imu else nearest_imu(frame.host_ts, imu_buffer, args.sync_max_dt_ms / 1000.0)
-            if not args.disable_imu:
-                if imu is None:
-                    stats["unsynced"] += 1
-                else:
-                    stats["synced"] += 1
-
-            if csv_writer is not None:
-                lag_ms = (frame.host_ts - imu.host_ts) * 1000.0 if imu else float("nan")
-                row = [frame.host_ts, lag_ms, int(frame.checksum_ok)] + corrected.reshape(-1).tolist()
-                if imu is None:
-                    row += [0, 0, 0, "", "", "", "", "", "", ""]
-                else:
-                    qw, qx, qy, qz = imu.quat_wxyz
-                    ax, ay, az = imu.acc_g
-                    row += [1, int(imu.crc_ok), int(imu.simple_sum_ok), ax, ay, az, qw, qx, qy, qz]
-                csv_writer.writerow(row)
+            if recording_enabled and frame.checksum_ok:
+                pressure_valid_buffer.append(pressure_record)
+            if recording_enabled and pressure_csv_writer is not None:
+                row = [frame.host_ts, int(frame.checksum_ok)] + csv_vals.reshape(-1).tolist()
+                pressure_csv_writer.writerow(row)
+            if recording_enabled:
+                flush_sync_rows(frame.host_ts)
 
     def on_imu(frame: ImuFrame):
-        nonlocal latest_imu
+        nonlocal latest_imu, imu_init_rot_world, imu_zero_status_msg, imu_zero_seq
+        nonlocal recording_enabled
         with lock:
-            latest_imu = frame
-            imu_buffer.append(frame)
+            rot_sw = imu_rot_sensor_to_world(frame.quat_wxyz, args.imu_quat_world_to_sensor)
+            if imu_init_rot_world is None:
+                imu_init_rot_world = rot_sw
+                imu_zero_seq += 1
+                imu_zero_status_msg = "IMU zero: locked"
+            rot_rel = imu_init_rot_world.T @ rot_sw
+            rot_human = racket_init_to_human @ rot_rel
+            quat_human = rotmat_to_quat_wxyz(rot_human)
+            acc_human_np = (rot_human @ np.asarray(frame.acc_g, dtype=np.float32)).astype(np.float32)
+            corrected_frame = CorrectedImuFrame(
+                host_ts=frame.host_ts,
+                device_ts_us=frame.device_ts_us,
+                qos=frame.qos,
+                quat_human_wxyz=quat_human,
+                acc_human_g=(float(acc_human_np[0]), float(acc_human_np[1]), float(acc_human_np[2])),
+                rot_human=rot_human,
+                crc_ok=frame.crc_ok,
+                simple_sum_ok=frame.simple_sum_ok,
+                zero_seq=imu_zero_seq,
+            )
+            latest_imu = corrected_frame
             stats["imu_frames"] += 1
             if not frame.crc_ok:
                 stats["imu_bad_crc"] += 1
             if not frame.simple_sum_ok:
                 stats["imu_bad_simple"] += 1
+            if recording_enabled and imu_csv_writer is not None:
+                imu_csv_writer.writerow(build_imu_row(corrected_frame))
+            if recording_enabled:
+                sync_pending_imu.append(corrected_frame)
+                flush_sync_rows(frame.host_ts)
 
     suffix_map = {"none": b"", "cr": b"\r", "lf": b"\n", "crlf": b"\r\n"}
 
@@ -1136,7 +1345,7 @@ def main() -> None:
                     if p is not None:
                         line += f" | Pmean/Pmax={float(np.mean(p.values)):.1f}/{float(np.max(p.values)):.1f}g"
                     if i is not None:
-                        ax, ay, az = i.acc_g
+                        ax, ay, az = i.acc_human_g
                         line += f" | acc=({ax:+.4f},{ay:+.4f},{az:+.4f})"
                     print(line)
                     last_print = now
@@ -1174,19 +1383,9 @@ def main() -> None:
             imu3d_enabled = False
             imu3d_error_msg = ""
             imu3d_source = "none"
-            imu_init_rot_world: Optional[np.ndarray] = None
             last_drawn_imu_ts: Optional[float] = None
             last_drawn_pressure_ts: Optional[float] = None
-            imu_zero_status_msg = "IMU zero: waiting first frame"
-
-            sensor0_to_view = np.array(
-                [
-                    [1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                    [0.0, -1.0, 0.0],
-                ],
-                dtype=np.float32,
-            )
+            racket_init_to_view = human0_to_view @ racket_init_to_human
 
             wire_shaft_sensor, wire_head_sensor, wire_face_sensor = build_wireframe_racket_sensor_frame()
             wire_shaft_item = None
@@ -1200,6 +1399,12 @@ def main() -> None:
                     import pyqtgraph.opengl as gl
                     from pyqtgraph.Qt import QtGui as _QtGui
 
+                    class UnlimitedGLViewWidget(gl.GLViewWidget):
+                        def orbit(self, azim: float, elev: float) -> None:
+                            self.opts["azimuth"] += azim
+                            self.opts["elevation"] += elev
+                            self.update()
+
                     QtGui = _QtGui
                     try:
                         import OpenGL.GL  # noqa: F401
@@ -1207,7 +1412,7 @@ def main() -> None:
                         raise RuntimeError(format_opengl_error(dep_err)) from dep_err
 
                     imu3d_enabled = True
-                    imu_view = gl.GLViewWidget()
+                    imu_view = UnlimitedGLViewWidget()
                     try:
                         imu_view.setBackgroundColor((255, 255, 255, 255))
                     except Exception:
@@ -1217,9 +1422,21 @@ def main() -> None:
                     imu_view.opts["azimuth"] = -40.0
                     top_row.addWidget(imu_view, stretch=1)
 
-                    axis = gl.GLAxisItem()
-                    axis.setSize(0.25, 0.25, 0.25)
-                    imu_view.addItem(axis)
+                    axis_len = 0.25
+                    axis_specs = [
+                        (np.array([[0.0, 0.0, 0.0], [axis_len, 0.0, 0.0]], dtype=np.float32), (1.0, 0.0, 0.0, 1.0)),
+                        (np.array([[0.0, 0.0, 0.0], [0.0, axis_len, 0.0]], dtype=np.float32), (0.0, 1.0, 0.0, 1.0)),
+                        (np.array([[0.0, 0.0, 0.0], [0.0, 0.0, axis_len]], dtype=np.float32), (0.0, 0.0, 1.0, 1.0)),
+                    ]
+                    for axis_pts_human, axis_color in axis_specs:
+                        axis_item = gl.GLLinePlotItem(
+                            pos=rotate_points(axis_pts_human, human0_to_view),
+                            color=axis_color,
+                            width=3.0,
+                            antialias=True,
+                            mode="line_strip",
+                        )
+                        imu_view.addItem(axis_item)
 
                     if not args.no_racket_obj:
                         obj_path = Path(args.racket_obj)
@@ -1254,6 +1471,8 @@ def main() -> None:
 
                             racket_mesh_item = gl.GLMeshItem(**mesh_kwargs)
                             imu_view.addItem(racket_mesh_item)
+                            if QtGui is not None:
+                                racket_mesh_item.setTransform(qmatrix_from_rot3(racket_init_to_view, QtGui))
                             if mesh.vertex_colors is not None and mesh.texture_path is not None:
                                 imu3d_source = f"obj:{obj_path.name} tex:{mesh.texture_path.name} faces={mesh.faces.shape[0]}"
                             else:
@@ -1263,21 +1482,21 @@ def main() -> None:
 
                     if racket_mesh_item is None:
                         wire_shaft_item = gl.GLLinePlotItem(
-                            pos=rotate_points(wire_shaft_sensor, sensor0_to_view),
+                            pos=rotate_points(wire_shaft_sensor, racket_init_to_view),
                             color=(1.0, 0.9, 0.2, 1.0),
                             width=4.0,
                             antialias=True,
                             mode="line_strip",
                         )
                         wire_head_item = gl.GLLinePlotItem(
-                            pos=rotate_points(wire_head_sensor, sensor0_to_view),
+                            pos=rotate_points(wire_head_sensor, racket_init_to_view),
                             color=(0.1, 0.8, 1.0, 1.0),
                             width=2.0,
                             antialias=True,
                             mode="line_strip",
                         )
                         wire_face_item = gl.GLLinePlotItem(
-                            pos=rotate_points(wire_face_sensor, sensor0_to_view),
+                            pos=rotate_points(wire_face_sensor, racket_init_to_view),
                             color=(1.0, 0.3, 0.3, 1.0),
                             width=2.0,
                             antialias=True,
@@ -1326,8 +1545,9 @@ def main() -> None:
                 pass
 
             def start_zero_calibration():
-                nonlocal zero_enabled, zero_calibrating, zero_start_ts, zero_samples, zero_status_msg
+                nonlocal zero_enabled, zero_calibrating, zero_start_ts, zero_samples, zero_status_msg, zero_duration_sec
                 with lock:
+                    zero_duration_sec = 5.0
                     zero_enabled = False
                     zero_calibrating = True
                     zero_start_ts = time.perf_counter()
@@ -1347,9 +1567,10 @@ def main() -> None:
 
             def reset_imu_zero_pose():
                 nonlocal imu_init_rot_world, imu_zero_status_msg, last_drawn_imu_ts
-                imu_init_rot_world = None
+                with lock:
+                    imu_init_rot_world = None
+                    imu_zero_status_msg = "IMU zero: waiting next frame"
                 last_drawn_imu_ts = None
-                imu_zero_status_msg = "IMU zero: waiting next frame"
                 print("[IMU] Zero pose reset")
 
             btn_zero_calib.clicked.connect(start_zero_calibration)
@@ -1357,7 +1578,7 @@ def main() -> None:
             btn_imu_reset.clicked.connect(reset_imu_zero_pose)
 
             def tick():
-                nonlocal last_drawn_pressure_ts, last_drawn_imu_ts, imu_init_rot_world, imu_zero_status_msg
+                nonlocal last_drawn_pressure_ts, last_drawn_imu_ts
                 if should_stop_by_duration():
                     app.quit()
                     return
@@ -1379,12 +1600,7 @@ def main() -> None:
                     last_drawn_pressure_ts = p_disp_ts
 
                 if imu3d_enabled and (i is not None) and (last_drawn_imu_ts != i.host_ts):
-                    rot_sw = imu_rot_sensor_to_world(i.quat_wxyz, args.imu_quat_world_to_sensor)
-                    if imu_init_rot_world is None:
-                        imu_init_rot_world = rot_sw
-                        imu_zero_status_msg = "IMU zero: locked"
-                    rot_rel = imu_init_rot_world.T @ rot_sw
-                    rot_view = sensor0_to_view @ rot_rel
+                    rot_view = human0_to_view @ i.rot_human
 
                     if racket_mesh_item is not None and QtGui is not None:
                         transform = qmatrix_from_rot3(rot_view, QtGui)
@@ -1421,8 +1637,8 @@ def main() -> None:
                 if p is not None:
                     lines.append(f"P mean/max = {float(np.mean(p.values)):.1f}/{float(np.max(p.values)):.1f} g")
                 if i is not None:
-                    ax, ay, az = i.acc_g
-                    qw, qx, qy, qz = i.quat_wxyz
+                    ax, ay, az = i.acc_human_g
+                    qw, qx, qy, qz = i.quat_human_wxyz
                     lines.append(f"acc[g]=({ax:+.5f}, {ay:+.5f}, {az:+.5f})")
                     lines.append(f"quat =({qw:+.6f}, {qx:+.6f}, {qy:+.6f}, {qz:+.6f})")
 
@@ -1449,8 +1665,10 @@ def main() -> None:
             imu_ingest.join(timeout=2.0)
         if imu_parse is not None:
             imu_parse.join(timeout=2.0)
-        if csv_fp is not None:
-            csv_fp.close()
+        with lock:
+            flush_sync_rows(float("inf"), force=True)
+        for fp in csv_files:
+            fp.close()
         print("Stopped")
 
     if request_software_relaunch:
