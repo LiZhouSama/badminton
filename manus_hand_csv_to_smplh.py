@@ -41,6 +41,7 @@ from xsens_mvn_csv_to_smplh import (
     local_to_global_rotmats,
     matrix_to_axis_angle,
     read_smplh_parents,
+    rotation_between_vectors,
     thumb_distal_local_rotmat_for_smpl,
     thumb_swing_local_rotmat_for_smpl,
 )
@@ -144,12 +145,13 @@ def parse_args() -> argparse.Namespace:
         "--thumb-source",
         choices=["segment-positions", "ergonomics"],
         default="ergonomics",
-        help="ergonomics uses MANUS Thumb_CMC/Thumb_PIP/Thumb_DIP flex-spread angles.",
+        help="ergonomics reconstructs MANUS thumb CMC from top/side projected angles.",
     )
     parser.add_argument("--finger-flex-sign", type=float, default=-1.0)
     parser.add_argument("--finger-spread-sign", type=float, default=1.0)
     parser.add_argument("--thumb-flex-sign", type=float, default=-1.0)
     parser.add_argument("--thumb-spread-sign", type=float, default=-1.0)
+    parser.add_argument("--thumb-ip-flex-sign", type=float, default=1.0)
     parser.add_argument("--palm-normal-sign", type=float, default=1.0)
     parser.add_argument("--max-frames", type=int, default=None)
     parser.add_argument("--frame-stride", type=int, default=1)
@@ -388,6 +390,12 @@ def hand_palm_normal(side: str, rest_joints: np.ndarray, palm_normal_sign: float
     return normalize_vector(normal * float(palm_normal_sign), f"{side} palm normal")
 
 
+def hand_forward_axis(side: str, rest_joints: np.ndarray) -> np.ndarray:
+    middle1_idx = SMPLH_52_NAMES.index(f"{side}_middle1")
+    middle2_idx = SMPLH_52_NAMES.index(f"{side}_middle2")
+    return normalize_vector(rest_joints[middle2_idx] - rest_joints[middle1_idx], f"{side} hand forward")
+
+
 def joint_rest_bone_axis(
     joint_idx: int,
     parents: np.ndarray,
@@ -457,10 +465,38 @@ def thumb_cmc_local_rotmat(
     thumb_flex_sign: float,
 ) -> np.ndarray:
     bone_axis = joint_rest_bone_axis(joint_idx, parents, children, rest_joints)
-    spread_axis = normalize_vector(np.cross(bone_axis, palm_normal), "thumb spread axis")
-    spread_rot = axis_angle_rotmat(spread_axis, spread_deg * thumb_spread_sign)
-    flex_rot = axis_angle_rotmat(palm_normal, flex_deg * thumb_flex_sign)
-    return (spread_rot @ flex_rot).astype(np.float32)
+    side = "left" if SMPLH_52_NAMES[joint_idx].startswith("left_") else "right"
+    forward_axis = hand_forward_axis(side, rest_joints)
+    palm_axis = normalize_vector(
+        palm_normal - np.dot(palm_normal, forward_axis) * forward_axis,
+        "thumb projected palm normal",
+    )
+    side_axis = normalize_vector(np.cross(palm_axis, forward_axis), "thumb projected side axis")
+    target_axis = normalize_vector(
+        forward_axis
+        + np.tan(np.deg2rad(flex_deg * thumb_flex_sign)) * side_axis
+        + np.tan(np.deg2rad(spread_deg * thumb_spread_sign)) * palm_axis,
+        "thumb CMC projected target axis",
+    )
+    return rotation_between_vectors(bone_axis, target_axis)
+
+
+def thumb_ip_top_view_local_rotmat(
+    joint_idx: int,
+    parent_global: np.ndarray,
+    parent_axis_global: np.ndarray,
+    palm_normal: np.ndarray,
+    flex_deg: float,
+    parents: np.ndarray,
+    children: Dict[int, List[int]],
+    rest_joints: np.ndarray,
+    flex_sign: float,
+) -> np.ndarray:
+    rest_axis = joint_rest_bone_axis(joint_idx, parents, children, rest_joints)
+    flex_rot = axis_angle_rotmat(palm_normal, flex_deg * flex_sign)
+    target_global = flex_rot @ normalize_vector(parent_axis_global, "thumb parent axis")
+    target_parent_local = parent_global.T @ target_global
+    return rotation_between_vectors(rest_axis, target_parent_local)
 
 
 def thumb_segment_position_local_rotmats(
@@ -513,6 +549,7 @@ def build_hand_local_rotmats_from_ergonomics(
     finger_spread_sign: float,
     thumb_flex_sign: float,
     thumb_spread_sign: float,
+    thumb_ip_flex_sign: float,
 ) -> np.ndarray:
     local = np.tile(np.eye(3, dtype=np.float32), (len(ergonomic_angles), 52, 1, 1))
     children = smplh_children(smplh_parents)
@@ -593,23 +630,33 @@ def build_hand_local_rotmats_from_ergonomics(
                 thumb_spread_sign=thumb_spread_sign,
                 thumb_flex_sign=thumb_flex_sign,
             )
-            local[frame_idx, thumb2] = finger_flex_local_rotmat(
+            thumb1_global = local[frame_idx, thumb1]
+            thumb1_axis = joint_rest_bone_axis(thumb1, smplh_parents, children, rest_joints)
+            thumb2_axis_global = thumb1_global @ thumb1_axis
+            local[frame_idx, thumb2] = thumb_ip_top_view_local_rotmat(
                 joint_idx=thumb2,
+                parent_global=thumb1_global,
+                parent_axis_global=thumb2_axis_global,
+                palm_normal=palm_normal,
                 flex_deg=angles[THUMB_ANGLE_COLUMNS["pip_flex"]],
                 parents=smplh_parents,
                 children=children,
                 rest_joints=rest_joints,
-                palm_normal=palm_normal,
-                flex_sign=thumb_flex_sign,
+                flex_sign=thumb_ip_flex_sign,
             )
-            local[frame_idx, thumb3] = finger_flex_local_rotmat(
+            thumb2_global = thumb1_global @ local[frame_idx, thumb2]
+            thumb2_axis = joint_rest_bone_axis(thumb2, smplh_parents, children, rest_joints)
+            thumb3_axis_global = thumb2_global @ thumb2_axis
+            local[frame_idx, thumb3] = thumb_ip_top_view_local_rotmat(
                 joint_idx=thumb3,
+                parent_global=thumb2_global,
+                parent_axis_global=thumb3_axis_global,
+                palm_normal=palm_normal,
                 flex_deg=angles[THUMB_ANGLE_COLUMNS["dip_flex"]],
                 parents=smplh_parents,
                 children=children,
                 rest_joints=rest_joints,
-                palm_normal=palm_normal,
-                flex_sign=thumb_flex_sign,
+                flex_sign=thumb_ip_flex_sign,
             )
         else:
             raise ValueError(f"Unsupported thumb source: {thumb_source!r}")
@@ -667,6 +714,7 @@ def retarget_manus_hand(
     finger_spread_sign: float,
     thumb_flex_sign: float,
     thumb_spread_sign: float,
+    thumb_ip_flex_sign: float,
 ) -> Dict[str, object]:
     body_model = create_body_model(body_model_path, num_betas, device)
     rest_joints = body_model_rest_joints(body_model, num_betas, device)
@@ -686,6 +734,7 @@ def retarget_manus_hand(
             finger_spread_sign=finger_spread_sign,
             thumb_flex_sign=thumb_flex_sign,
             thumb_spread_sign=thumb_spread_sign,
+            thumb_ip_flex_sign=thumb_ip_flex_sign,
         )
         smplh_global = local_to_global_rotmats(smplh_local, smplh_parents)
     elif retarget_source == "segment-rotations":
@@ -726,7 +775,7 @@ def retarget_manus_hand(
         "time_code_ms": torch.from_numpy(time_code_ms),
         "elapsed_time_ms": torch.from_numpy(elapsed_time_ms.astype(np.float32, copy=False)),
         "source_manus_csv": str(csv_path),
-        "retarget_mode": f"manus_wide_hand_to_smplh_{retarget_source}_v2",
+        "retarget_mode": f"manus_wide_hand_to_smplh_{retarget_source}_v5",
         "coord_mode": "xsens_zup_to_smpl",
         "hand_mode": (
             f"manus_ergonomics_angles_to_smplh_{finger_axis_mode}_finger_axes"
@@ -737,7 +786,7 @@ def retarget_manus_hand(
             (
                 "manus_thumb_position_swing_for_cmc_mcp_distal_swing_only"
                 if thumb_source == "segment-positions"
-                else "manus_ergonomics_thumb_cmc_spread_flex_pip_dip"
+                else "manus_ergonomics_thumb_cmc_projected_forward_ip_top_view"
             )
             if retarget_source == "ergonomics"
             else "manus_thumb_position_swing_for_cmc_mcp_distal_swing_only"
@@ -752,6 +801,7 @@ def retarget_manus_hand(
         "finger_spread_sign": float(finger_spread_sign),
         "thumb_flex_sign": float(thumb_flex_sign),
         "thumb_spread_sign": float(thumb_spread_sign),
+        "thumb_ip_flex_sign": float(thumb_ip_flex_sign),
         "manus_position_scale_to_meters": float(MANUS_POSITION_SCALE_TO_METERS),
         "body_model_path": str(body_model_path),
         "smplh_52_names": SMPLH_52_NAMES,
@@ -773,7 +823,11 @@ def retarget_manus_hand(
             "Only one MANUS hand is present. Root orientation, body pose, translation, "
             "and the missing hand are zero. The default populated hand path uses "
             "MANUS ergonomics flex/spread angles mapped to SMPL-H rest-palm finger "
-            "axes, with MANUS thumb ergonomics angles for thumb CMC/PIP/DIP. "
+            "axes. Thumb CMC is reconstructed from MANUS top/side projected "
+            "flex/spread angles relative to the hand forward axis, then aligned "
+            "from the SMPL-H rest thumb axis. Thumb PIP/DIP flex angles follow "
+            "MANUS top-view semantics by rotating each distal segment around the "
+            "palm normal relative to its parent thumb segment. "
             "Use --retarget-source segment-rotations for the older world-rotation-relative path."
         ),
     }
@@ -889,6 +943,7 @@ def main() -> None:
         finger_spread_sign=args.finger_spread_sign,
         thumb_flex_sign=args.thumb_flex_sign,
         thumb_spread_sign=args.thumb_spread_sign,
+        thumb_ip_flex_sign=args.thumb_ip_flex_sign,
     )
     save_pt(data, args.output)
     print_header_summary(args.csv)
