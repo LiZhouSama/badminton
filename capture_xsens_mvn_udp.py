@@ -12,6 +12,10 @@ The MXTP02 pose CSV is written in long format: one row per streamed segment.
 When finger tracking is enabled in MVN, the stream normally contains 23 body
 segments plus 40 finger-tracking segments.
 
+Every decoded row carries both a host wall-clock timestamp and a host monotonic
+timestamp so other same-host acquisition processes can align their streams while
+still using monotonic time for low-jitter elapsed-time calculations.
+
 Recent MVN Analyze network-streamer documentation describes position values as
 meters. Older protocol PDFs described centimeters, so this script keeps both
 meter and centimeter columns but treats the received float as meters by default.
@@ -31,13 +35,22 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 
 DEFAULT_PORT = 9763
 HEADER_SIZE = 24
 HEADER_STRUCT = struct.Struct(">6sIBBIBBBBHH")
 POSITION_UNIT = "m"
+
+CLOCK_SYNC_COLUMNS = [
+    "event",
+    "host_wall_ts_s",
+    "host_wall_iso",
+    "host_perf_ts_s",
+    "host_perf_to_wall_offset_s",
+    "host_clock_sample_span_s",
+]
 
 BODY_SEGMENTS = [
     "Pelvis",
@@ -89,6 +102,9 @@ FINGER_SEGMENTS = [
 ]
 
 PACKET_COLUMNS = [
+    "host_wall_ts_s",
+    "host_perf_ts_s",
+    "host_clock_sample_span_s",
     "recv_time_s",
     "recv_time_iso",
     "source_ip",
@@ -116,6 +132,9 @@ PACKET_COLUMNS = [
 ]
 
 BASE_DETAIL_COLUMNS = [
+    "host_wall_ts_s",
+    "host_perf_ts_s",
+    "host_clock_sample_span_s",
     "recv_time_s",
     "recv_time_iso",
     "source_ip",
@@ -351,6 +370,8 @@ class DatagramPart:
     header: MvnHeader
     payload: bytes
     recv_time_s: float
+    host_perf_time_s: float
+    host_clock_sample_span_s: float
     source_ip: str
     source_port: int
     packet_seq: int
@@ -406,6 +427,29 @@ def format_time_s(ts: float) -> str:
 
 def format_time_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts).isoformat(timespec="milliseconds")
+
+
+def sample_host_clock() -> Tuple[float, float, float]:
+    perf_before = time.perf_counter()
+    wall = time.time()
+    perf_after = time.perf_counter()
+    return wall, (perf_before + perf_after) * 0.5, perf_after - perf_before
+
+
+def clock_sync_row(event: str) -> Dict[str, object]:
+    wall, perf, span = sample_host_clock()
+    return {
+        "event": event,
+        "host_wall_ts_s": format_time_s(wall),
+        "host_wall_iso": format_time_iso(wall),
+        "host_perf_ts_s": f"{perf:.9f}",
+        "host_perf_to_wall_offset_s": f"{wall - perf:.9f}",
+        "host_clock_sample_span_s": f"{span:.9f}",
+    }
+
+
+def write_clock_sync_sample(sink: CsvSink, event: str) -> None:
+    sink.write("clock_sync.csv", CLOCK_SYNC_COLUMNS, clock_sync_row(event))
 
 
 def parse_datagram(data: bytes) -> Tuple[MvnHeader, bytes]:
@@ -467,6 +511,9 @@ def packet_row(
 ) -> Dict[str, object]:
     h = part.header
     return {
+        "host_wall_ts_s": format_time_s(part.recv_time_s),
+        "host_perf_ts_s": f"{part.host_perf_time_s:.9f}",
+        "host_clock_sample_span_s": f"{part.host_clock_sample_span_s:.9f}",
         "recv_time_s": format_time_s(part.recv_time_s),
         "recv_time_iso": format_time_iso(part.recv_time_s),
         "source_ip": part.source_ip,
@@ -497,6 +544,8 @@ def packet_row(
 def invalid_packet_row(
     data: bytes,
     recv_time_s: float,
+    host_perf_time_s: float,
+    host_clock_sample_span_s: float,
     source_ip: str,
     source_port: int,
     packet_seq: int,
@@ -504,6 +553,9 @@ def invalid_packet_row(
 ) -> Dict[str, object]:
     packet_id = data[:6].decode("ascii", errors="replace") if data else ""
     return {
+        "host_wall_ts_s": format_time_s(recv_time_s),
+        "host_perf_ts_s": f"{host_perf_time_s:.9f}",
+        "host_clock_sample_span_s": f"{host_clock_sample_span_s:.9f}",
         "recv_time_s": format_time_s(recv_time_s),
         "recv_time_iso": format_time_iso(recv_time_s),
         "source_ip": source_ip,
@@ -526,6 +578,9 @@ def base_detail_row(
 ) -> Dict[str, object]:
     h = part.header
     return {
+        "host_wall_ts_s": format_time_s(part.recv_time_s),
+        "host_perf_ts_s": f"{part.host_perf_time_s:.9f}",
+        "host_clock_sample_span_s": f"{part.host_clock_sample_span_s:.9f}",
         "recv_time_s": format_time_s(part.recv_time_s),
         "recv_time_iso": format_time_iso(part.recv_time_s),
         "source_ip": part.source_ip,
@@ -674,12 +729,13 @@ def parse_pose_records(
     segment_id_base_arg: str,
     sink: CsvSink,
     stats: Counter,
-) -> None:
+) -> List[Dict[str, object]]:
     parsed: List[Tuple[DatagramPart, int, int, Tuple[object, ...]]] = []
     order_index = 0
     message_type = parts[0].header.message_type
     fmt = struct.Struct(">Iffffff") if message_type == "01" else struct.Struct(">Ifffffff")
     warning_by_part: Dict[int, str] = {}
+    rows: List[Dict[str, object]] = []
 
     for part in parts:
         warning_by_part[part.packet_seq] = payload_warning(part.header, fmt.size)
@@ -736,7 +792,9 @@ def parse_pose_records(
                 }
             )
         sink.write("mvn_pose_segments.csv", POSE_COLUMNS, row)
+        rows.append(row)
         stats["pose_rows"] += 1
+    return rows
 
 
 def parse_point_records(
@@ -1114,6 +1172,7 @@ def decode_sample(
     segment_id_base_arg: str,
     sink: CsvSink,
     stats: Counter,
+    pose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ) -> None:
     if not parts:
         return
@@ -1129,7 +1188,7 @@ def decode_sample(
     message_type = ordered[0].header.message_type
     try:
         if message_type in {"01", "02", "05"}:
-            parse_pose_records(
+            pose_rows = parse_pose_records(
                 ordered,
                 sample_complete,
                 missing,
@@ -1138,6 +1197,8 @@ def decode_sample(
                 stats,
             )
             stats["pose_samples"] += 1
+            if pose_callback is not None and pose_rows:
+                pose_callback(pose_rows)
         elif message_type == "03":
             parse_point_records(ordered, sample_complete, missing, sink, stats)
         elif message_type == "12":
@@ -1197,10 +1258,11 @@ def handle_part(
     segment_id_base_arg: str,
     sink: CsvSink,
     stats: Counter,
+    pose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ) -> None:
     h = part.header
     if h.datagram_is_last and h.datagram_index == 0:
-        decode_sample([part], True, segment_id_base_arg, sink, stats)
+        decode_sample([part], True, segment_id_base_arg, sink, stats, pose_callback)
         return
 
     key = sample_key(h)
@@ -1218,7 +1280,7 @@ def handle_part(
         expected = set(range(state.last_index + 1))
         if expected.issubset(state.parts):
             parts = [state.parts[i] for i in sorted(expected)]
-            decode_sample(parts, True, segment_id_base_arg, sink, stats)
+            decode_sample(parts, True, segment_id_base_arg, sink, stats, pose_callback)
             del pending[key]
 
 
@@ -1229,6 +1291,7 @@ def flush_stale_pending(
     segment_id_base_arg: str,
     sink: CsvSink,
     stats: Counter,
+    pose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ) -> None:
     stale_keys = [
         key for key, state in pending.items() if now_s - state.first_seen_s >= timeout_s
@@ -1241,6 +1304,7 @@ def flush_stale_pending(
             segment_id_base_arg,
             sink,
             stats,
+            pose_callback,
         )
         stats["incomplete_samples_flushed"] += 1
 
@@ -1250,10 +1314,18 @@ def flush_all_pending(
     segment_id_base_arg: str,
     sink: CsvSink,
     stats: Counter,
+    pose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
 ) -> None:
     for key in list(pending.keys()):
         state = pending.pop(key)
-        decode_sample(list(state.parts.values()), False, segment_id_base_arg, sink, stats)
+        decode_sample(
+            list(state.parts.values()),
+            False,
+            segment_id_base_arg,
+            sink,
+            stats,
+            pose_callback,
+        )
         stats["incomplete_samples_flushed"] += 1
 
 
@@ -1272,6 +1344,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--pending-timeout-s", type=float, default=1.0)
     parser.add_argument("--flush-every", type=int, default=100)
     parser.add_argument("--print-every", type=int, default=100)
+    parser.add_argument(
+        "--clock-sync-interval-s",
+        type=float,
+        default=5.0,
+        help="Write host wall/perf clock calibration samples at this interval; <=0 disables periodic samples.",
+    )
     parser.add_argument(
         "--segment-id-base",
         choices=["auto", "zero", "one"],
@@ -1316,30 +1394,52 @@ def print_status(stats: Counter, output_dir: Path) -> None:
     )
 
 
-def capture(args: argparse.Namespace) -> Counter:
+def capture(
+    args: argparse.Namespace,
+    pose_callback: Optional[Callable[[List[Dict[str, object]]], None]] = None,
+    stop_event: object = None,
+    install_signal_handlers: bool = True,
+) -> Counter:
     stop_requested = False
 
     def _request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop_requested
         stop_requested = True
 
-    signal.signal(signal.SIGINT, _request_stop)
-    signal.signal(signal.SIGTERM, _request_stop)
+    if install_signal_handlers:
+        signal.signal(signal.SIGINT, _request_stop)
+        signal.signal(signal.SIGTERM, _request_stop)
 
     sink = CsvSink(args.output_dir)
     pending: Dict[Tuple[str, int, int], PendingSample] = {}
     stats: Counter = Counter()
     start_s = time.monotonic()
+    last_clock_sync_s = start_s
+
+    def maybe_write_periodic_clock_sync() -> None:
+        nonlocal last_clock_sync_s
+        if args.clock_sync_interval_s <= 0:
+            return
+        now_s = time.monotonic()
+        if now_s - last_clock_sync_s >= args.clock_sync_interval_s:
+            write_clock_sync_sample(sink, "periodic")
+            last_clock_sync_s = now_s
 
     print(f"[MVN] Listening on {args.bind_ip}:{args.port}")
     print(f"[MVN] Writing CSV files under {args.output_dir}")
+    write_clock_sync_sample(sink, "capture_start")
 
     sock = open_udp_socket(args)
     try:
-        while not stop_requested and not should_stop(args, stats, start_s):
+        while (
+            not stop_requested
+            and not (stop_event is not None and stop_event.is_set())
+            and not should_stop(args, stats, start_s)
+        ):
             try:
                 data, (source_ip, source_port) = sock.recvfrom(args.recv_bytes)
             except socket.timeout:
+                maybe_write_periodic_clock_sync()
                 flush_stale_pending(
                     pending,
                     time.time(),
@@ -1347,6 +1447,7 @@ def capture(args: argparse.Namespace) -> Counter:
                     args.segment_id_base,
                     sink,
                     stats,
+                    pose_callback,
                 )
                 continue
 
@@ -1354,7 +1455,7 @@ def capture(args: argparse.Namespace) -> Counter:
                 stats["packets_ignored_by_source"] += 1
                 continue
 
-            recv_time_s = time.time()
+            recv_time_s, host_perf_time_s, host_clock_span_s = sample_host_clock()
             stats["packets"] += 1
             packet_seq = stats["packets"]
 
@@ -1364,6 +1465,8 @@ def capture(args: argparse.Namespace) -> Counter:
                     header=header,
                     payload=payload,
                     recv_time_s=recv_time_s,
+                    host_perf_time_s=host_perf_time_s,
+                    host_clock_sample_span_s=host_clock_span_s,
                     source_ip=source_ip,
                     source_port=source_port,
                     packet_seq=packet_seq,
@@ -1372,7 +1475,7 @@ def capture(args: argparse.Namespace) -> Counter:
                 if not header.valid_mxtp:
                     stats["invalid_mxtp"] += 1
                     continue
-                handle_part(part, pending, args.segment_id_base, sink, stats)
+                handle_part(part, pending, args.segment_id_base, sink, stats, pose_callback)
             except MvnPacketError as exc:
                 sink.write(
                     "mvn_packets.csv",
@@ -1380,6 +1483,8 @@ def capture(args: argparse.Namespace) -> Counter:
                     invalid_packet_row(
                         data,
                         recv_time_s,
+                        host_perf_time_s,
+                        host_clock_span_s,
                         source_ip,
                         source_port,
                         packet_seq,
@@ -1395,13 +1500,16 @@ def capture(args: argparse.Namespace) -> Counter:
                 args.segment_id_base,
                 sink,
                 stats,
+                pose_callback,
             )
             if args.flush_every > 0 and packet_seq % args.flush_every == 0:
                 sink.flush()
             if args.print_every > 0 and packet_seq % args.print_every == 0:
                 print_status(stats, args.output_dir)
+            maybe_write_periodic_clock_sync()
     finally:
-        flush_all_pending(pending, args.segment_id_base, sink, stats)
+        flush_all_pending(pending, args.segment_id_base, sink, stats, pose_callback)
+        write_clock_sync_sample(sink, "capture_stop")
         sink.flush()
         sink.close()
         sock.close()
@@ -1475,10 +1583,13 @@ def run_self_test() -> None:
         sink = CsvSink(output_dir)
         stats: Counter = Counter()
         header, payload = parse_datagram(make_synthetic_packet())
+        recv_time_s, host_perf_time_s, host_clock_span_s = sample_host_clock()
         part = DatagramPart(
             header=header,
             payload=payload,
-            recv_time_s=time.time(),
+            recv_time_s=recv_time_s,
+            host_perf_time_s=host_perf_time_s,
+            host_clock_sample_span_s=host_clock_span_s,
             source_ip="127.0.0.1",
             source_port=9763,
             packet_seq=1,
@@ -1500,11 +1611,14 @@ def run_self_test() -> None:
         pending: Dict[Tuple[str, int, int], PendingSample] = {}
         for packet_seq, packet in enumerate(make_synthetic_split_packets(), start=1):
             header, payload = parse_datagram(packet)
+            recv_time_s, host_perf_time_s, host_clock_span_s = sample_host_clock()
             handle_part(
                 DatagramPart(
                     header=header,
                     payload=payload,
-                    recv_time_s=time.time(),
+                    recv_time_s=recv_time_s,
+                    host_perf_time_s=host_perf_time_s,
+                    host_clock_sample_span_s=host_clock_span_s,
                     source_ip="127.0.0.1",
                     source_port=9763,
                     packet_seq=packet_seq,

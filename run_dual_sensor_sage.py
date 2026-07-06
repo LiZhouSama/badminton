@@ -9,6 +9,8 @@ Features:
 - Pressure heatmap visualization with interpolation
 - Optional IMU 3D visualization with OpenGL fallback strategy
 - Optional OBJ racket model rendering and real-time pose sync
+- CSV timestamps include both host monotonic time and host wall-clock time so
+  same-host acquisition processes can align streams in software.
 """
 
 from __future__ import annotations
@@ -35,6 +37,15 @@ import serial
 OPENGL_INSTALL_HINT = "pip install PyOpenGL PyOpenGL_accelerate"
 DEFAULT_RACKET_OBJ = Path("obj/badminton_racket/Racket.obj")
 
+CLOCK_SYNC_HEADER = [
+    "event",
+    "host_wall_ts_s",
+    "host_wall_iso",
+    "host_perf_ts_s",
+    "host_perf_to_wall_offset_s",
+    "host_clock_sample_span_s",
+]
+
 UI_TEXT = {
     "title": "Dual Sensor SAGE (Windows High Performance)",
     "waiting": "Waiting data...",
@@ -50,6 +61,25 @@ UI_TEXT = {
 }
 
 
+def sample_host_clock() -> Tuple[float, float, float]:
+    perf_before = time.perf_counter()
+    wall = time.time()
+    perf_after = time.perf_counter()
+    return wall, (perf_before + perf_after) * 0.5, perf_after - perf_before
+
+
+def host_clock_row(event: str) -> List[object]:
+    wall, perf, span = sample_host_clock()
+    return [
+        event,
+        f"{wall:.6f}",
+        datetime.fromtimestamp(wall).isoformat(timespec="milliseconds"),
+        f"{perf:.9f}",
+        f"{wall - perf:.9f}",
+        f"{span:.9f}",
+    ]
+
+
 class OpenGLAutoRetryRequested(RuntimeError):
     """Signal to restart process once with software OpenGL."""
 
@@ -57,6 +87,7 @@ class OpenGLAutoRetryRequested(RuntimeError):
 @dataclass
 class PressureFrame:
     host_ts: float
+    host_wall_ts_s: float
     values: np.ndarray
     checksum_ok: bool
     csv_values: Optional[np.ndarray] = None
@@ -65,6 +96,7 @@ class PressureFrame:
 @dataclass
 class ImuFrame:
     host_ts: float
+    host_wall_ts_s: float
     device_ts_us: int
     qos: int
     quat_wxyz: Tuple[float, float, float, float]
@@ -76,6 +108,7 @@ class ImuFrame:
 @dataclass
 class CorrectedImuFrame:
     host_ts: float
+    host_wall_ts_s: float
     device_ts_us: int
     qos: int
     quat_human_wxyz: Tuple[float, float, float, float]
@@ -138,7 +171,7 @@ class M1616MParser:
     def __init__(self) -> None:
         self.buf = bytearray()
 
-    def feed(self, data: bytes, host_ts: float) -> List[PressureFrame]:
+    def feed(self, data: bytes, host_ts: float, host_wall_ts_s: float) -> List[PressureFrame]:
         self.buf.extend(data)
         out: List[PressureFrame] = []
 
@@ -156,7 +189,14 @@ class M1616MParser:
             frame = bytes(self.buf[: self.FRAME_LEN])
             ok = (sum(frame[:515]) & 0xFF) == frame[515]
             vals = np.frombuffer(frame[3:515], dtype=">u2").astype(np.float32).reshape(16, 16)
-            out.append(PressureFrame(host_ts=host_ts, values=vals, checksum_ok=ok))
+            out.append(
+                PressureFrame(
+                    host_ts=host_ts,
+                    host_wall_ts_s=host_wall_ts_s,
+                    values=vals,
+                    checksum_ok=ok,
+                )
+            )
             del self.buf[: self.FRAME_LEN]
 
         return out
@@ -168,7 +208,13 @@ class TB100Parser:
     def __init__(self) -> None:
         self.buf = bytearray()
 
-    def _parse_payload64(self, payload: bytes, host_ts: float, crc_ok: bool) -> ImuFrame:
+    def _parse_payload64(
+        self,
+        payload: bytes,
+        host_ts: float,
+        host_wall_ts_s: float,
+        crc_ok: bool,
+    ) -> ImuFrame:
         fmt = "<I H h h H 4i 3i 3i 3h b B H H"
         (
             ts_us,
@@ -198,6 +244,7 @@ class TB100Parser:
         simple_ok = (sum(payload[:62]) & 0xFFFF) == simple_sum_i
         return ImuFrame(
             host_ts=host_ts,
+            host_wall_ts_s=host_wall_ts_s,
             device_ts_us=ts_us,
             qos=(status & 0x7),
             quat_wxyz=(qw_i * 1e-7, qx_i * 1e-7, qy_i * 1e-7, qz_i * 1e-7),
@@ -206,7 +253,7 @@ class TB100Parser:
             simple_sum_ok=simple_ok,
         )
 
-    def feed(self, data: bytes, host_ts: float) -> List[ImuFrame]:
+    def feed(self, data: bytes, host_ts: float, host_wall_ts_s: float) -> List[ImuFrame]:
         self.buf.extend(data)
         out: List[ImuFrame] = []
 
@@ -233,7 +280,7 @@ class TB100Parser:
                 payload64 = content[4:68]
                 if len(payload64) == 64:
                     try:
-                        out.append(self._parse_payload64(payload64, host_ts, crc_ok))
+                        out.append(self._parse_payload64(payload64, host_ts, host_wall_ts_s, crc_ok))
                     except struct.error:
                         pass
 
@@ -283,7 +330,8 @@ class SerialIngestThread(threading.Thread):
                 chunk = self.ser.read(min(self.read_chunk, n) if n > 0 else 1)
                 if not chunk:
                     continue
-                item = (time.perf_counter(), chunk)
+                host_wall_ts_s, host_ts, _clock_span_s = sample_host_clock()
+                item = (host_ts, host_wall_ts_s, chunk)
                 try:
                     self.out_q.put_nowait(item)
                 except queue.Full:
@@ -316,10 +364,10 @@ class ParserThread(threading.Thread):
     def run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                ts, chunk = self.in_q.get(timeout=0.05)
+                ts, wall_ts, chunk = self.in_q.get(timeout=0.05)
             except queue.Empty:
                 continue
-            frames = self.parser.feed(chunk, host_ts=ts)
+            frames = self.parser.feed(chunk, host_ts=ts, host_wall_ts_s=wall_ts)
             if not frames:
                 continue
             key = f"{self.name.lower()}_parsed_frames"
@@ -964,6 +1012,12 @@ def main() -> None:
 
     ap.add_argument("--sync-max-dt-ms", type=float, default=200.0)
     ap.add_argument("--save-csv", default="output")
+    ap.add_argument(
+        "--clock-sync-interval-sec",
+        type=float,
+        default=5.0,
+        help="Write host wall/perf clock calibration samples at this interval; <=0 disables periodic samples.",
+    )
 
     ap.add_argument("--fps", type=float, default=60.0)
     ap.add_argument("--opengl-mode", choices=["auto", "desktop", "software", "none"], default="auto")
@@ -1052,9 +1106,13 @@ def main() -> None:
     pressure_csv_writer = None
     imu_csv_writer = None
     sync_csv_writer = None
-    pressure_header = ["pressure_host_ts", "pressure_checksum_ok"] + [f"p_{i}" for i in range(256)]
+    clock_sync_writer = None
+    pressure_header = ["pressure_host_ts", "pressure_host_wall_ts_s", "pressure_checksum_ok"] + [
+        f"p_{i}" for i in range(256)
+    ]
     imu_header = [
         "imu_host_ts",
+        "imu_host_wall_ts_s",
         "imu_device_ts_us",
         "imu_qos",
         "imu_crc_ok",
@@ -1068,9 +1126,18 @@ def main() -> None:
         "imu_qy",
         "imu_qz",
     ]
-    sync_header = imu_header + ["pressure_matched", "pressure_host_ts", "sync_lag_ms", "pressure_checksum_ok"] + [
-        f"p_{i}" for i in range(256)
-    ]
+    sync_header = (
+        imu_header
+        + [
+            "pressure_matched",
+            "pressure_host_ts",
+            "pressure_host_wall_ts_s",
+            "sync_lag_ms",
+            "sync_lag_wall_ms",
+            "pressure_checksum_ok",
+        ]
+        + [f"p_{i}" for i in range(256)]
+    )
     if args.save_csv:
         out_root = Path(args.save_csv)
         out_root.mkdir(parents=True, exist_ok=True)
@@ -1084,13 +1151,17 @@ def main() -> None:
         pressure_fp = (csv_dir / "pressure.csv").open("w", newline="", encoding="utf-8")
         imu_fp = (csv_dir / "imu.csv").open("w", newline="", encoding="utf-8")
         sync_fp = (csv_dir / "sync.csv").open("w", newline="", encoding="utf-8")
-        csv_files.extend([pressure_fp, imu_fp, sync_fp])
+        clock_fp = (csv_dir / "clock_sync.csv").open("w", newline="", encoding="utf-8")
+        csv_files.extend([pressure_fp, imu_fp, sync_fp, clock_fp])
         pressure_csv_writer = csv.writer(pressure_fp)
         imu_csv_writer = csv.writer(imu_fp)
         sync_csv_writer = csv.writer(sync_fp)
+        clock_sync_writer = csv.writer(clock_fp)
         pressure_csv_writer.writerow(pressure_header)
         imu_csv_writer.writerow(imu_header)
         sync_csv_writer.writerow(sync_header)
+        clock_sync_writer.writerow(CLOCK_SYNC_HEADER)
+        clock_sync_writer.writerow(host_clock_row("capture_start"))
         print(f"[CSV] Writing folder: {csv_dir}")
 
     def build_imu_row(frame: CorrectedImuFrame) -> List[object]:
@@ -1098,6 +1169,7 @@ def main() -> None:
         ax, ay, az = frame.acc_human_g
         return [
             frame.host_ts,
+            frame.host_wall_ts_s,
             frame.device_ts_us,
             frame.qos,
             int(frame.crc_ok),
@@ -1128,11 +1200,18 @@ def main() -> None:
                 stats["synced"] += 1
             if sync_csv_writer is not None:
                 lag_ms = (pressure_frame.host_ts - imu_frame.host_ts) * 1000.0 if pressure_frame is not None else float("nan")
+                lag_wall_ms = (
+                    (pressure_frame.host_wall_ts_s - imu_frame.host_wall_ts_s) * 1000.0
+                    if pressure_frame is not None
+                    else float("nan")
+                )
                 row = build_imu_row(imu_frame)
                 row += [
                     int(pressure_frame is not None),
                     pressure_frame.host_ts if pressure_frame is not None else "",
+                    pressure_frame.host_wall_ts_s if pressure_frame is not None else "",
                     lag_ms,
+                    lag_wall_ms,
                     int(pressure_frame.checksum_ok) if pressure_frame is not None else "",
                 ]
                 row += build_pressure_cells(pressure_frame)
@@ -1201,6 +1280,7 @@ def main() -> None:
             )
             pressure_record = PressureFrame(
                 host_ts=frame.host_ts,
+                host_wall_ts_s=frame.host_wall_ts_s,
                 values=corrected,
                 checksum_ok=frame.checksum_ok,
                 csv_values=csv_vals,
@@ -1215,7 +1295,7 @@ def main() -> None:
             if recording_enabled and frame.checksum_ok:
                 pressure_valid_buffer.append(pressure_record)
             if recording_enabled and pressure_csv_writer is not None:
-                row = [frame.host_ts, int(frame.checksum_ok)] + csv_vals.reshape(-1).tolist()
+                row = [frame.host_ts, frame.host_wall_ts_s, int(frame.checksum_ok)] + csv_vals.reshape(-1).tolist()
                 pressure_csv_writer.writerow(row)
             if recording_enabled:
                 flush_sync_rows(frame.host_ts)
@@ -1235,6 +1315,7 @@ def main() -> None:
             acc_human_np = (rot_human @ np.asarray(frame.acc_g, dtype=np.float32)).astype(np.float32)
             corrected_frame = CorrectedImuFrame(
                 host_ts=frame.host_ts,
+                host_wall_ts_s=frame.host_wall_ts_s,
                 device_ts_us=frame.device_ts_us,
                 qos=frame.qos,
                 quat_human_wxyz=quat_human,
@@ -1318,11 +1399,21 @@ def main() -> None:
     )
 
     start_ts = time.perf_counter()
+    last_clock_sync_ts = start_ts
     request_software_relaunch = False
     software_relaunch_reason = ""
 
     def should_stop_by_duration() -> bool:
         return args.duration_sec > 0 and (time.perf_counter() - start_ts) >= args.duration_sec
+
+    def maybe_write_clock_sync_sample() -> None:
+        nonlocal last_clock_sync_ts
+        if clock_sync_writer is None or args.clock_sync_interval_sec <= 0:
+            return
+        now = time.perf_counter()
+        if now - last_clock_sync_ts >= args.clock_sync_interval_sec:
+            clock_sync_writer.writerow(host_clock_row("periodic"))
+            last_clock_sync_ts = now
 
     try:
         if args.headless:
@@ -1349,6 +1440,7 @@ def main() -> None:
                         line += f" | acc=({ax:+.4f},{ay:+.4f},{az:+.4f})"
                     print(line)
                     last_print = now
+                    maybe_write_clock_sync_sample()
                 time.sleep(0.01)
         else:
             import pyqtgraph as pg
@@ -1646,6 +1738,7 @@ def main() -> None:
                 btn_zero_clear.setEnabled(z_calib or z_enabled)
                 btn_imu_reset.setEnabled((not args.disable_imu) and imu3d_enabled)
                 lbl.setText("\n".join(lines))
+                maybe_write_clock_sync_sample()
 
             timer.timeout.connect(tick)
             timer.start()
@@ -1667,6 +1760,8 @@ def main() -> None:
             imu_parse.join(timeout=2.0)
         with lock:
             flush_sync_rows(float("inf"), force=True)
+        if clock_sync_writer is not None:
+            clock_sync_writer.writerow(host_clock_row("capture_stop"))
         for fp in csv_files:
             fp.close()
         print("Stopped")
