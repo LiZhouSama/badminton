@@ -237,6 +237,79 @@ THUMB_SWING_POSITION_PAIRS = {
     **RIGHT_THUMB_SWING_POSITION_PAIRS,
 }
 THUMB_DISTAL_JOINTS = {"left_thumb3", "right_thumb3"}
+THUMB_JOINTS = {
+    "left_thumb1",
+    "left_thumb2",
+    "left_thumb3",
+    "right_thumb1",
+    "right_thumb2",
+    "right_thumb3",
+}
+
+LEFT_FINGER_CHAIN_SEGMENTS = {
+    "index": (
+        "Left Second Proximal Phalange",
+        "Left Second Middle Phalange",
+        "Left Second Distal Phalange",
+    ),
+    "middle": (
+        "Left Third Proximal Phalange",
+        "Left Third Middle Phalange",
+        "Left Third Distal Phalange",
+    ),
+    "pinky": (
+        "Left Fifth Proximal Phalange",
+        "Left Fifth Middle Phalange",
+        "Left Fifth Distal Phalange",
+    ),
+    "ring": (
+        "Left Fourth Proximal Phalange",
+        "Left Fourth Middle Phalange",
+        "Left Fourth Distal Phalange",
+    ),
+}
+
+LEFT_FINGER_SWING_POSITION_PAIRS = {
+    f"left_{finger}1": (proximal, middle)
+    for finger, (proximal, middle, _distal) in LEFT_FINGER_CHAIN_SEGMENTS.items()
+}
+LEFT_FINGER_SWING_POSITION_PAIRS.update(
+    {
+        f"left_{finger}2": (middle, distal)
+        for finger, (_proximal, middle, distal) in LEFT_FINGER_CHAIN_SEGMENTS.items()
+    }
+)
+
+RIGHT_FINGER_SWING_POSITION_PAIRS = {
+    key.replace("left_", "right_"): (
+        start.replace("Left ", "Right "),
+        end.replace("Left ", "Right "),
+    )
+    for key, (start, end) in LEFT_FINGER_SWING_POSITION_PAIRS.items()
+}
+
+FINGER_SWING_POSITION_PAIRS = {
+    **LEFT_FINGER_SWING_POSITION_PAIRS,
+    **RIGHT_FINGER_SWING_POSITION_PAIRS,
+}
+
+LEFT_FINGER_DISTAL_AXIS_SEGMENTS = {
+    f"left_{finger}3": (distal, middle, distal)
+    for finger, (_proximal, middle, distal) in LEFT_FINGER_CHAIN_SEGMENTS.items()
+}
+RIGHT_FINGER_DISTAL_AXIS_SEGMENTS = {
+    key.replace("left_", "right_"): (
+        distal.replace("Left ", "Right "),
+        reference_start.replace("Left ", "Right "),
+        reference_end.replace("Left ", "Right "),
+    )
+    for key, (distal, reference_start, reference_end) in LEFT_FINGER_DISTAL_AXIS_SEGMENTS.items()
+}
+
+FINGER_DISTAL_AXIS_SEGMENTS = {
+    **LEFT_FINGER_DISTAL_AXIS_SEGMENTS,
+    **RIGHT_FINGER_DISTAL_AXIS_SEGMENTS,
+}
 
 
 @dataclass
@@ -265,6 +338,12 @@ class MvnSequence:
 class RetargetConfig:
     arm_correction: str
     arm_twist_filter: str
+
+
+@dataclass
+class HandRetargetCache:
+    rest_axes: Dict[int, np.ndarray]
+    distal_segment_axes: Dict[str, Tuple[int, float]] = field(default_factory=dict)
 
 
 def parse_args() -> argparse.Namespace:
@@ -611,6 +690,40 @@ def rest_bone_axis(rest_joints: np.ndarray, start_idx: int, end_idx: int) -> np.
     return (axis / axis_norm).astype(np.float32)
 
 
+def smplh_children(parents: np.ndarray) -> Dict[int, List[int]]:
+    children: Dict[int, List[int]] = {}
+    for idx, parent_idx in enumerate(parents):
+        if int(parent_idx) >= 0:
+            children.setdefault(int(parent_idx), []).append(idx)
+    return children
+
+
+def smplh_rest_axis_for_joint(
+    joint_idx: int,
+    parents: np.ndarray,
+    children: Dict[int, List[int]],
+    rest_joints: np.ndarray,
+) -> np.ndarray:
+    joint_children = children.get(joint_idx, [])
+    if joint_children:
+        return rest_bone_axis(rest_joints, joint_idx, joint_children[0])
+    parent_idx = int(parents[joint_idx])
+    if parent_idx < 0:
+        raise ValueError(f"Joint {joint_idx} has no parent or child for rest bone axis")
+    return rest_bone_axis(rest_joints, parent_idx, joint_idx)
+
+
+def build_hand_retarget_cache(smplh_parents: np.ndarray, rest_joints: np.ndarray) -> HandRetargetCache:
+    children = smplh_children(smplh_parents)
+    rest_axes = {
+        idx: smplh_rest_axis_for_joint(idx, smplh_parents, children, rest_joints)
+        for idx in range(22, len(SMPLH_52_NAMES))
+    }
+    return HandRetargetCache(
+        rest_axes=rest_axes,
+    )
+
+
 def normalize_vector(vector: np.ndarray, name: str) -> np.ndarray:
     vector = vector.astype(np.float32, copy=False)
     norm = float(np.linalg.norm(vector))
@@ -619,23 +732,50 @@ def normalize_vector(vector: np.ndarray, name: str) -> np.ndarray:
     return (vector / norm).astype(np.float32)
 
 
+def axis_angle_rotmat_rad(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    axis = normalize_vector(axis, "axis-angle axis")
+    x, y, z = axis.astype(np.float64)
+    k = np.array(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    sin_angle = np.sin(angle_rad)
+    cos_angle = np.cos(angle_rad)
+    return (np.eye(3, dtype=np.float64) + sin_angle * k + (1.0 - cos_angle) * (k @ k)).astype(np.float32)
+
+
 def rotation_between_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
     source = normalize_vector(source, "rotation source")
     target = normalize_vector(target, "rotation target")
-    axis = np.cross(source, target)
-    axis_norm = float(np.linalg.norm(axis))
+    cross = np.cross(source, target).astype(np.float64)
+    cross_norm = float(np.linalg.norm(cross))
     dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
-    if axis_norm < 1e-8:
+    if cross_norm < 1e-8:
         if dot > 0.0:
             return np.eye(3, dtype=np.float32)
         fallback = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         if abs(float(np.dot(source, fallback))) > 0.9:
             fallback = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         axis = normalize_vector(np.cross(source, fallback), "antiparallel rotation axis")
-        return Rotation.from_rotvec(axis * np.pi).as_matrix().astype(np.float32)
-    axis = axis / axis_norm
-    angle = np.arccos(dot)
-    return Rotation.from_rotvec(axis * angle).as_matrix().astype(np.float32)
+        return axis_angle_rotmat_rad(axis, np.pi)
+    x, y, z = cross
+    k = np.array(
+        [
+            [0.0, -z, y],
+            [z, 0.0, -x],
+            [-y, x, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    return (
+        np.eye(3, dtype=np.float64)
+        + k
+        + (k @ k) * ((1.0 - dot) / (cross_norm * cross_norm))
+    ).astype(np.float32)
 
 
 def remove_arm_twist_keep_measured_wrists(
@@ -780,26 +920,86 @@ def finger_local_rotmat_for_smpl(frame: FramePose, joint_name: str) -> np.ndarra
     return (parent_global.T @ child_global).astype(np.float32)
 
 
-def finger_position_for_smpl(source: Dict[str, SegmentPose], mvn_name: str) -> np.ndarray:
-    pose = source[mvn_name]
-    return convert_position_coord(pose.pos_m, pose.coordinate_system)
+def finger_positions_for_smpl(source: Dict[str, SegmentPose]) -> Dict[str, np.ndarray]:
+    return {
+        mvn_name: convert_position_coord(pose.pos_m, pose.coordinate_system)
+        for mvn_name, pose in source.items()
+    }
 
 
 def thumb_swing_local_rotmat_for_smpl(
+    joint_name: str,
+    parent_global: np.ndarray,
+    source_positions: Dict[str, np.ndarray],
+    rest_direction: np.ndarray,
+) -> np.ndarray:
+    start_mvn_name, end_mvn_name, _child_joint_name = THUMB_SWING_POSITION_PAIRS[joint_name]
+    target_global = normalize_vector(
+        source_positions[end_mvn_name] - source_positions[start_mvn_name],
+        f"{joint_name} MVN thumb position direction",
+    )
+    target_parent_local = parent_global.T @ target_global
+    return rotation_between_vectors(rest_direction, target_parent_local)
+
+
+def finger_position_swing_local_rotmat_for_smpl(
+    joint_name: str,
+    parent_global: np.ndarray,
+    source_positions: Dict[str, np.ndarray],
+    rest_direction: np.ndarray,
+) -> np.ndarray:
+    start_mvn_name, end_mvn_name = FINGER_SWING_POSITION_PAIRS[joint_name]
+    target_global = normalize_vector(
+        source_positions[end_mvn_name] - source_positions[start_mvn_name],
+        f"{joint_name} MVN position direction",
+    )
+    target_parent_local = parent_global.T @ target_global
+    return rotation_between_vectors(rest_direction, target_parent_local)
+
+
+def stable_segment_long_axis_for_smpl(
+    pose: SegmentPose,
+    reference_direction: np.ndarray,
+    axis_cache: Dict[str, Tuple[int, float]],
+    cache_key: str,
+) -> np.ndarray:
+    rotmat = finger_segment_rotmat_for_smpl(pose)
+    if cache_key not in axis_cache:
+        reference = normalize_vector(reference_direction, "segment long-axis reference")
+        best_axis_idx = 0
+        best_sign = 1.0
+        best_dot = -np.inf
+        for axis_idx in range(3):
+            axis = rotmat[:, axis_idx]
+            for sign in (1.0, -1.0):
+                dot = float(np.dot(sign * axis, reference))
+                if dot > best_dot:
+                    best_dot = dot
+                    best_axis_idx = axis_idx
+                    best_sign = sign
+        axis_cache[cache_key] = (best_axis_idx, best_sign)
+
+    axis_idx, sign = axis_cache[cache_key]
+    return normalize_vector(sign * rotmat[:, axis_idx], "stable segment long axis")
+
+
+def finger_distal_axis_local_rotmat_for_smpl(
     frame: FramePose,
     joint_name: str,
     parent_global: np.ndarray,
-    rest_joints: np.ndarray,
+    source_positions: Dict[str, np.ndarray],
+    rest_direction: np.ndarray,
+    hand_cache: HandRetargetCache,
 ) -> np.ndarray:
-    start_mvn_name, end_mvn_name, child_joint_name = THUMB_SWING_POSITION_PAIRS[joint_name]
+    distal_mvn_name, reference_start_name, reference_end_name = FINGER_DISTAL_AXIS_SEGMENTS[joint_name]
     source = finger_source_for_joint(frame, joint_name)
-    target_global = normalize_vector(
-        finger_position_for_smpl(source, end_mvn_name) - finger_position_for_smpl(source, start_mvn_name),
-        f"{joint_name} MANUS position direction",
+    reference_direction = source_positions[reference_end_name] - source_positions[reference_start_name]
+    target_global = stable_segment_long_axis_for_smpl(
+        pose=source[distal_mvn_name],
+        reference_direction=reference_direction,
+        axis_cache=hand_cache.distal_segment_axes,
+        cache_key=joint_name,
     )
-    joint_idx = SMPLH_52_NAMES.index(joint_name)
-    child_idx = SMPLH_52_NAMES.index(child_joint_name)
-    rest_direction = rest_bone_axis(rest_joints, joint_idx, child_idx)
     target_parent_local = parent_global.T @ target_global
     return rotation_between_vectors(rest_direction, target_parent_local)
 
@@ -807,14 +1007,65 @@ def thumb_swing_local_rotmat_for_smpl(
 def thumb_distal_local_rotmat_for_smpl(
     frame: FramePose,
     joint_name: str,
-    rest_joints: np.ndarray,
+    parent_global: np.ndarray,
+    source_positions: Dict[str, np.ndarray],
+    rest_direction: np.ndarray,
+    hand_cache: HandRetargetCache,
 ) -> np.ndarray:
-    local = finger_local_rotmat_for_smpl(frame, joint_name)
-    joint_idx = SMPLH_52_NAMES.index(joint_name)
-    parent_joint_name = "left_thumb2" if joint_name.startswith("left_") else "right_thumb2"
-    parent_idx = SMPLH_52_NAMES.index(parent_joint_name)
-    incoming_axis = rest_bone_axis(rest_joints, parent_idx, joint_idx)
-    return remove_twist_around_axis(local[None, :, :], incoming_axis)[0]
+    start_mvn_name, end_mvn_name = HAND_JOINT_MVN_PAIRS[joint_name]
+    source = finger_source_for_joint(frame, joint_name)
+    incoming_direction = source_positions[end_mvn_name] - source_positions[start_mvn_name]
+    target_global = stable_segment_long_axis_for_smpl(
+        pose=source[end_mvn_name],
+        reference_direction=incoming_direction,
+        axis_cache=hand_cache.distal_segment_axes,
+        cache_key=joint_name,
+    )
+    target_parent_local = parent_global.T @ target_global
+    return rotation_between_vectors(rest_direction, target_parent_local)
+
+
+def hand_local_rotmat_for_smpl(
+    frame: FramePose,
+    joint_name: str,
+    parent_global: np.ndarray,
+    source_positions: Dict[str, np.ndarray],
+    rest_direction: np.ndarray,
+    hand_cache: HandRetargetCache,
+) -> np.ndarray:
+    if joint_name in THUMB_SWING_POSITION_PAIRS:
+        return thumb_swing_local_rotmat_for_smpl(
+            joint_name=joint_name,
+            parent_global=parent_global,
+            source_positions=source_positions,
+            rest_direction=rest_direction,
+        )
+    if joint_name in THUMB_DISTAL_JOINTS:
+        return thumb_distal_local_rotmat_for_smpl(
+            frame=frame,
+            joint_name=joint_name,
+            parent_global=parent_global,
+            source_positions=source_positions,
+            rest_direction=rest_direction,
+            hand_cache=hand_cache,
+        )
+    if joint_name in THUMB_JOINTS:
+        return finger_local_rotmat_for_smpl(frame, joint_name)
+    if joint_name in FINGER_DISTAL_AXIS_SEGMENTS:
+        return finger_distal_axis_local_rotmat_for_smpl(
+            frame=frame,
+            joint_name=joint_name,
+            parent_global=parent_global,
+            source_positions=source_positions,
+            rest_direction=rest_direction,
+            hand_cache=hand_cache,
+        )
+    return finger_position_swing_local_rotmat_for_smpl(
+        joint_name=joint_name,
+        parent_global=parent_global,
+        source_positions=source_positions,
+        rest_direction=rest_direction,
+    )
 
 
 def build_smplh_global_rotmats(
@@ -822,10 +1073,17 @@ def build_smplh_global_rotmats(
     smpl24_global: np.ndarray,
     smplh_parents: np.ndarray,
     rest_joints: np.ndarray,
+    hand_cache: Optional[HandRetargetCache] = None,
 ) -> np.ndarray:
     full = np.tile(np.eye(3, dtype=np.float32), (len(frames), 52, 1, 1))
     full[:, :22] = smpl24_global[:, :22]
+    if hand_cache is None:
+        hand_cache = build_hand_retarget_cache(smplh_parents, rest_joints)
     for frame_idx, frame in enumerate(frames):
+        finger_positions = {
+            "left": finger_positions_for_smpl(frame.left_finger),
+            "right": finger_positions_for_smpl(frame.right_finger),
+        }
         for joint_idx in range(22, full.shape[1]):
             joint_name = SMPLH_52_NAMES[joint_idx]
             parent_idx = int(smplh_parents[joint_idx])
@@ -834,21 +1092,15 @@ def build_smplh_global_rotmats(
                     np.eye(3, dtype=np.float32) if parent_idx < 0 else full[frame_idx, parent_idx]
                 )
                 continue
-            if joint_name in THUMB_SWING_POSITION_PAIRS:
-                local = thumb_swing_local_rotmat_for_smpl(
-                    frame=frame,
-                    joint_name=joint_name,
-                    parent_global=full[frame_idx, parent_idx],
-                    rest_joints=rest_joints,
-                )
-            elif joint_name in THUMB_DISTAL_JOINTS:
-                local = thumb_distal_local_rotmat_for_smpl(
-                    frame=frame,
-                    joint_name=joint_name,
-                    rest_joints=rest_joints,
-                )
-            else:
-                local = finger_local_rotmat_for_smpl(frame, joint_name)
+            side = "left" if joint_name.startswith("left_") else "right"
+            local = hand_local_rotmat_for_smpl(
+                frame=frame,
+                joint_name=joint_name,
+                parent_global=full[frame_idx, parent_idx],
+                source_positions=finger_positions[side],
+                rest_direction=hand_cache.rest_axes[joint_idx],
+                hand_cache=hand_cache,
+            )
             full[frame_idx, joint_idx] = (full[frame_idx, parent_idx] @ local).astype(np.float32)
     return full
 
@@ -934,6 +1186,7 @@ def retarget_sequence(
     body_model = create_body_model(body_model_path, num_betas, device)
     rest_joints = body_model_rest_joints(body_model, num_betas, device)
     smplh_parents = read_smplh_parents(body_model_path)
+    hand_cache = build_hand_retarget_cache(smplh_parents, rest_joints)
     smpl24_global = build_smpl24_global_rotmats(frames, arm_correction=config.arm_correction)
     smpl24_local = global_to_local_rotmats(smpl24_global, SMPL24_PARENTS)
     smplh_global = build_smplh_global_rotmats(
@@ -941,6 +1194,7 @@ def retarget_sequence(
         smpl24_global=smpl24_global,
         smplh_parents=smplh_parents,
         rest_joints=rest_joints,
+        hand_cache=hand_cache,
     )
     smplh_local_raw = global_to_local_rotmats(smplh_global, smplh_parents)
     if config.arm_twist_filter == "none":
@@ -1000,11 +1254,11 @@ def retarget_sequence(
         "time_code_ms": torch.from_numpy(time_code_ms),
         "source_mvn_dir": str(sequence.source_csv.parent),
         "source_pose_csv": str(sequence.source_csv),
-        "retarget_mode": "xsens_global_segment_to_smplh_v2",
+        "retarget_mode": "xsens_global_segment_to_smplh_v5",
         "coord_mode": "xsens_zup_to_smpl",
         "body_mapping_profile": "mvnx_to_smpl",
-        "hand_mode": "xsens_relative_fingers_thumb_position_swing",
-        "thumb_retarget_mode": "manus_thumb_position_swing_for_cmc_mcp_distal_swing_only",
+        "hand_mode": "xsens_shifted_position_swing_fingers_and_thumb_stable_distal_axis",
+        "thumb_retarget_mode": "xsens_thumb_position_swing_stable_distal_axis",
         "arm_correction": config.arm_correction,
         "arm_twist_filter": arm_twist_filter,
         "wrist_twist_limit_deg": float(WRIST_TWIST_LIMIT_DEG),
@@ -1030,12 +1284,18 @@ def retarget_sequence(
         "body_mapping": dict(MVN_BODY_TO_SMPL24),
         "hand_mapping": dict(HAND_MVN_TO_SMPLH),
         "hand_joint_mvn_pairs": dict(HAND_JOINT_MVN_PAIRS),
+        "finger_position_swing_pairs": dict(FINGER_SWING_POSITION_PAIRS),
+        "finger_distal_axis_segments": dict(FINGER_DISTAL_AXIS_SEGMENTS),
+        "finger_distal_axis_mode": "first_frame_locked_segment_local_axis",
         "thumb_swing_position_pairs": dict(THUMB_SWING_POSITION_PAIRS),
+        "thumb_distal_axis_mode": "first_frame_locked_segment_local_axis",
         "notes": (
             "Xsens global segment orientations are converted into the SMPL frame before "
-            "global-to-local retargeting. SMPL-H finger pose is driven by relative "
-            "Xsens finger segment rotations, except thumb CMC/MCP use MANUS position-chain "
-            "swing directions and the distal thumb joint is twist-filtered. "
+            "global-to-local retargeting. SMPL-H proximal and middle finger pose is "
+            "driven by shifted MVN position-chain swing directions, while distal "
+            "finger joints use first-frame locked distal segment local axes because "
+            "MVN has no fingertip position target. Thumb CMC/MCP use position-chain swing and the distal "
+            "thumb joint uses the first-frame locked distal segment local axis. "
             "By default, arm/hand body segments keep raw Xsens segment frames with no +90 degree "
             "post-rotation and no arm twist filtering."
         ),
@@ -1067,8 +1327,8 @@ def print_summary(data: Dict[str, object], output: Path) -> None:
         )
     )
     print(
-        "[NOTE] Fixed path: Xsens Z-up -> SMPL, MVNX body mapping, Xsens relative fingers, "
-        "MANUS thumb position-swing, and raw arm/hand body segment frames by default."
+        "[NOTE] Fixed path: Xsens Z-up -> SMPL, MVNX body mapping, MVN position-chain "
+        "shifted finger swing, stable thumb/finger distal axes, and raw arm/hand body segment frames by default."
     )
 
 

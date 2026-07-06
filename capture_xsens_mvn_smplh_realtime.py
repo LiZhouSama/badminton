@@ -28,6 +28,8 @@ import torch
 import capture_xsens_mvn_udp as mvn_udp
 from xsens_mvn_csv_to_smplh import (
     DEFAULT_BODY_MODEL,
+    FINGER_DISTAL_AXIS_SEGMENTS,
+    FINGER_SWING_POSITION_PAIRS,
     HAND_JOINT_MVN_PAIRS,
     HAND_MVN_TO_SMPLH,
     MVN_BODY_TO_SMPL24,
@@ -40,6 +42,7 @@ from xsens_mvn_csv_to_smplh import (
     SegmentPose,
     body_model_rest_joints,
     build_smpl24_global_rotmats,
+    build_hand_retarget_cache,
     build_smplh_global_rotmats,
     check_rotation_orthogonality,
     compute_trans_from_pelvis,
@@ -78,6 +81,7 @@ class SharedRealtimeState:
         self.lock = threading.Lock()
         self.counters: Counter = Counter()
         self.latest_vertices: Optional[np.ndarray] = None
+        self.latest_vertices_sample_counter: Optional[int] = None
         self.latest_sample_counter: Optional[int] = None
         self.latest_time_code_ms: Optional[int] = None
         self.latest_host_wall_ts_s: Optional[float] = None
@@ -103,6 +107,7 @@ class RealtimeSmplhRetargeter:
         self.rest_joints = body_model_rest_joints(self.body_model, num_betas, self.device)
         self.rest_root = self.rest_joints[0]
         self.smplh_parents = read_smplh_parents(body_model_path)
+        self.hand_retarget_cache = build_hand_retarget_cache(self.smplh_parents, self.rest_joints)
         self.faces = self.body_model.f.detach().cpu().numpy().astype(np.int32)
 
     def retarget_frame(self, frame: FramePose, include_vertices: bool) -> RealtimeSmplhFrame:
@@ -116,6 +121,7 @@ class RealtimeSmplhRetargeter:
             smpl24_global=smpl24_global,
             smplh_parents=self.smplh_parents,
             rest_joints=self.rest_joints,
+            hand_cache=self.hand_retarget_cache,
         )
         smplh_local_raw = global_to_local_rotmats(smplh_global, self.smplh_parents)
         if self.config.arm_twist_filter == "none":
@@ -190,11 +196,11 @@ class RealtimeSmplhRetargeter:
         return {
             "source_mvn_dir": str(source_pose_csv.parent),
             "source_pose_csv": str(source_pose_csv),
-            "retarget_mode": "xsens_global_segment_to_smplh_v2",
+            "retarget_mode": "xsens_global_segment_to_smplh_v5",
             "coord_mode": "xsens_zup_to_smpl",
             "body_mapping_profile": "mvnx_to_smpl",
-            "hand_mode": "xsens_relative_fingers_thumb_position_swing",
-            "thumb_retarget_mode": "manus_thumb_position_swing_for_cmc_mcp_distal_swing_only",
+            "hand_mode": "xsens_shifted_position_swing_fingers_and_thumb_stable_distal_axis",
+            "thumb_retarget_mode": "xsens_thumb_position_swing_stable_distal_axis",
             "arm_correction": self.config.arm_correction,
             "arm_twist_filter": self.config.arm_twist_filter,
             "wrist_twist_limit_deg": float(WRIST_TWIST_LIMIT_DEG),
@@ -205,10 +211,17 @@ class RealtimeSmplhRetargeter:
             "body_mapping": dict(MVN_BODY_TO_SMPL24),
             "hand_mapping": dict(HAND_MVN_TO_SMPLH),
             "hand_joint_mvn_pairs": dict(HAND_JOINT_MVN_PAIRS),
+            "finger_position_swing_pairs": dict(FINGER_SWING_POSITION_PAIRS),
+            "finger_distal_axis_segments": dict(FINGER_DISTAL_AXIS_SEGMENTS),
+            "finger_distal_axis_mode": "first_frame_locked_segment_local_axis",
             "thumb_swing_position_pairs": dict(THUMB_SWING_POSITION_PAIRS),
+            "thumb_distal_axis_mode": "first_frame_locked_segment_local_axis",
             "notes": (
                 "Realtime Xsens UDP retargeting. CSV rows are written by capture_xsens_mvn_udp.py; "
-                "SMPL-H pose/trans are accumulated in memory and checkpointed periodically."
+                "SMPL-H pose/trans are accumulated in memory and checkpointed periodically. "
+                "Hand retargeting uses shifted MVN position-chain swing directions for proximal "
+                "and middle finger joints, first-frame locked distal segment local axes for finger tips, and distal "
+                "thumb first-frame locked distal segment local axes."
             ),
         }
 
@@ -317,6 +330,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pt-checkpoint-every-s", type=float, default=5.0)
     parser.add_argument("--pt-checkpoint-every-frames", type=int, default=0)
     parser.add_argument("--retarget-queue-size", type=int, default=1024)
+    parser.add_argument(
+        "--keep-stale-retarget-frames",
+        action="store_true",
+        help=(
+            "Process every queued pose frame in viewer mode. By default, viewer mode drops stale queued "
+            "frames to keep visual latency low; the raw MVN CSV is still saved completely."
+        ),
+    )
     parser.add_argument("--status-every-s", type=float, default=1.0)
     return parser.parse_args()
 
@@ -362,6 +383,14 @@ def host_timestamps_from_pose_rows(rows: Sequence[Dict[str, object]]) -> Tuple[f
     return float(wall_raw), float(perf_raw)
 
 
+def smplh_vertices_to_pyqtgraph(vertices: np.ndarray) -> np.ndarray:
+    display_vertices = np.empty_like(vertices)
+    display_vertices[..., 0] = vertices[..., 0]
+    display_vertices[..., 1] = -vertices[..., 2]
+    display_vertices[..., 2] = vertices[..., 1]
+    return display_vertices
+
+
 def build_capture_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         bind_ip=args.bind_ip,
@@ -399,11 +428,12 @@ def make_status_lines(
     elapsed = max(1e-6, time.monotonic() - start_s)
     lines = [
         "decoded_pose={decoded} retargeted={retargeted} saved={saved} "
-        "mesh={mesh} skipped={skipped} errors={errors}".format(
+        "mesh={mesh} dropped={dropped} skipped={skipped} errors={errors}".format(
             decoded=counters["decoded_pose_samples"],
             retargeted=counters["retargeted_frames"],
             saved=counters["saved_frames"],
             mesh=counters["mesh_frames"],
+            dropped=counters["dropped_stale_pose_samples"],
             skipped=counters["skipped_pose_samples"],
             errors=counters["retarget_errors"],
         ),
@@ -441,11 +471,22 @@ def retarget_worker(
     stop_event: threading.Event,
     state: SharedRealtimeState,
 ) -> None:
-    include_vertices = args.viewer != "none"
+    use_viewer = args.viewer != "none"
+    drop_stale = use_viewer and not args.keep_stale_retarget_frames
+    mesh_interval_s = 1.0 / max(1.0, float(args.display_fps))
+    last_mesh_s = 0.0
     pt_output = args.pt_output or (args.output_dir / "xsens_mvn_smplh_realtime.pt")
     checkpoint_output = pt_output.with_name(pt_output.stem + "_checkpoint.pt")
+    metadata = retargeter.metadata(args.output_dir / "mvn_pose_segments.csv")
+    metadata.update(
+        {
+            "viewer_low_latency_drop_stale_frames": bool(drop_stale),
+            "keep_stale_retarget_frames": bool(args.keep_stale_retarget_frames),
+            "mesh_forward_fps_limit": float(args.display_fps) if use_viewer else 0.0,
+        }
+    )
     accumulator = SmplhPtAccumulator(
-        metadata=retargeter.metadata(args.output_dir / "mvn_pose_segments.csv"),
+        metadata=metadata,
         num_betas=args.num_betas,
     )
     last_checkpoint_s = time.monotonic()
@@ -458,7 +499,23 @@ def retarget_worker(
             except queue.Empty:
                 continue
             try:
+                if drop_stale:
+                    dropped = 0
+                    while True:
+                        try:
+                            newer_rows = pose_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        pose_queue.task_done()
+                        rows = newer_rows
+                        dropped += 1
+                    if dropped:
+                        with state.lock:
+                            state.counters["dropped_stale_pose_samples"] += dropped
+
                 frame = frame_from_pose_rows(rows)
+                now_s = time.monotonic()
+                include_vertices = use_viewer and (last_mesh_s <= 0.0 or now_s - last_mesh_s >= mesh_interval_s)
                 smplh_frame = retargeter.retarget_frame(frame, include_vertices=include_vertices)
                 smplh_frame.host_wall_ts_s, smplh_frame.host_perf_ts_s = host_timestamps_from_pose_rows(rows)
                 accumulator.add(smplh_frame)
@@ -470,7 +527,9 @@ def retarget_worker(
                     state.latest_host_wall_ts_s = smplh_frame.host_wall_ts_s
                     if smplh_frame.vertices is not None:
                         state.latest_vertices = smplh_frame.vertices
+                        state.latest_vertices_sample_counter = smplh_frame.sample_counter
                         state.counters["mesh_frames"] += 1
+                        last_mesh_s = now_s
 
                 now_s = time.monotonic()
                 time_due = args.pt_checkpoint_every_s > 0 and now_s - last_checkpoint_s >= args.pt_checkpoint_every_s
@@ -504,16 +563,29 @@ def capture_worker(
     stop_event: threading.Event,
     state: SharedRealtimeState,
 ) -> None:
+    drop_stale = args.viewer != "none" and not args.keep_stale_retarget_frames
+
     def enqueue_pose_rows(rows: List[Dict[str, object]]) -> None:
         with state.lock:
             state.counters["decoded_pose_samples"] += 1
         while not stop_event.is_set():
             try:
-                pose_queue.put(rows, timeout=0.1)
+                if drop_stale:
+                    pose_queue.put_nowait(rows)
+                else:
+                    pose_queue.put(rows, timeout=0.1)
                 return
             except queue.Full:
                 with state.lock:
                     state.counters["queue_full_waits"] += 1
+                if drop_stale:
+                    try:
+                        pose_queue.get_nowait()
+                        pose_queue.task_done()
+                    except queue.Empty:
+                        continue
+                    with state.lock:
+                        state.counters["dropped_stale_pose_samples"] += 1
 
     try:
         stats = mvn_udp.capture(
@@ -563,6 +635,20 @@ def run_pyqtgraph_viewer(
     import pyqtgraph.opengl as gl
     from pyqtgraph.Qt import QtCore, QtWidgets
 
+    class StableGLViewWidget(gl.GLViewWidget):
+        @staticmethod
+        def _event_pos(event):
+            return event.position() if hasattr(event, "position") else event.localPos()
+
+        def mousePressEvent(self, event):
+            self.mousePos = self._event_pos(event)
+            event.accept()
+
+        def mouseReleaseEvent(self, event):
+            if hasattr(self, "mousePos"):
+                del self.mousePos
+            event.accept()
+
     pg.setConfigOptions(antialias=False, useOpenGL=True)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     app.aboutToQuit.connect(stop_event.set)
@@ -570,7 +656,8 @@ def run_pyqtgraph_viewer(
     win = QtWidgets.QWidget()
     win.setWindowTitle("Realtime Xsens MVN -> SMPL-H")
     layout = QtWidgets.QVBoxLayout(win)
-    view = gl.GLViewWidget()
+    view = StableGLViewWidget()
+    view.setBackgroundColor("#666666")
     view.opts["distance"] = 3.0
     view.opts["elevation"] = 15.0
     view.opts["azimuth"] = -65.0
@@ -579,6 +666,8 @@ def run_pyqtgraph_viewer(
     grid = gl.GLGridItem()
     grid.setSize(x=4.0, y=4.0, z=0.0)
     grid.setSpacing(x=0.5, y=0.5, z=0.5)
+    if hasattr(grid, "setColor"):
+        grid.setColor((0.32, 0.32, 0.32, 1.0))
     view.addItem(grid)
 
     label = QtWidgets.QLabel("Waiting for Xsens MVN UDP pose packets...")
@@ -597,13 +686,14 @@ def run_pyqtgraph_viewer(
     def tick() -> None:
         with state.lock:
             vertices = None if state.latest_vertices is None else state.latest_vertices.copy()
-            sample_counter = state.latest_sample_counter
+            sample_counter = state.latest_vertices_sample_counter
         if vertices is not None and sample_counter != mesh_item["sample_counter"]:
+            display_vertices = smplh_vertices_to_pyqtgraph(vertices)
             if mesh_item["item"] is None:
                 mesh_item["item"] = gl.GLMeshItem(
-                    vertexes=vertices,
+                    vertexes=display_vertices,
                     faces=retargeter.faces,
-                    color=(0.72, 0.72, 0.72, 1.0),
+                    color=(0.96, 0.96, 0.96, 1.0),
                     smooth=False,
                     drawEdges=False,
                     drawFaces=True,
@@ -611,7 +701,7 @@ def run_pyqtgraph_viewer(
                 )
                 view.addItem(mesh_item["item"])
             else:
-                mesh_item["item"].setMeshData(vertexes=vertices, faces=retargeter.faces)
+                mesh_item["item"].setMeshData(vertexes=display_vertices, faces=retargeter.faces)
             mesh_item["sample_counter"] = sample_counter
 
         label.setText("\n".join(make_status_lines(state, pose_queue, start_s)))
