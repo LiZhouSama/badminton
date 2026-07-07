@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env python3
 """
-Windows high-performance dual sensor runner.
+Cross-platform high-performance dual sensor runner.
 
 Features:
 - M1616M pressure stream parser (16x16 matrix)
@@ -20,6 +20,8 @@ import csv
 import math
 import os
 import queue
+import select
+import socket
 import struct
 import sys
 import threading
@@ -28,7 +30,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Deque, List, Optional, Tuple
+from typing import Any, Callable, Deque, List, Optional, Tuple
 
 import numpy as np
 import serial
@@ -47,7 +49,7 @@ CLOCK_SYNC_HEADER = [
 ]
 
 UI_TEXT = {
-    "title": "Dual Sensor SAGE (Windows High Performance)",
+    "title": "Dual Sensor SAGE",
     "waiting": "Waiting data...",
     "zero_btn_start": "Start Zero Calibration",
     "zero_btn_clear": "Clear Zero Calibration",
@@ -59,6 +61,131 @@ UI_TEXT = {
     "zero_disabled": "disabled",
     "zero_cleared": "Zero calibration: cleared",
 }
+
+
+def is_wsl() -> bool:
+    if os.name != "posix":
+        return False
+    for path in ("/proc/sys/kernel/osrelease", "/proc/version"):
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore").lower()
+        except OSError:
+            continue
+        if "microsoft" in text or "wsl" in text:
+            return True
+    return False
+
+
+def default_windows_host_ip() -> str:
+    env_value = os.environ.get("WSL_WINDOWS_HOST") or os.environ.get("WINDOWS_HOST")
+    if env_value:
+        return env_value.strip()
+
+    try:
+        with Path("/proc/net/route").open("r", encoding="ascii", errors="ignore") as fp:
+            next(fp, None)
+            for raw in fp:
+                fields = raw.split()
+                if len(fields) >= 3 and fields[1] == "00000000":
+                    gateway_hex = fields[2]
+                    octets = [str(int(gateway_hex[i : i + 2], 16)) for i in range(0, 8, 2)]
+                    return ".".join(reversed(octets))
+    except OSError:
+        pass
+
+    try:
+        with Path("/etc/resolv.conf").open("r", encoding="utf-8", errors="ignore") as fp:
+            for raw in fp:
+                parts = raw.strip().split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    return parts[1]
+    except OSError:
+        pass
+
+    return "127.0.0.1"
+
+
+def normalize_port_spec(port: str) -> str:
+    if port.startswith("wintcp://"):
+        tail = port[len("wintcp://") :]
+        if tail.isdigit():
+            return f"tcp://{default_windows_host_ip()}:{tail}"
+        if ":" not in tail:
+            raise ValueError(f"Invalid wintcp port spec: {port}")
+        return f"tcp://{tail}"
+    if port.startswith("socket://"):
+        return "tcp://" + port[len("socket://") :]
+    return port
+
+
+def parse_tcp_port_spec(port: str) -> Optional[Tuple[str, int]]:
+    normalized = normalize_port_spec(port)
+    if not normalized.startswith("tcp://"):
+        return None
+    tail = normalized[len("tcp://") :]
+    if ":" not in tail:
+        raise ValueError(f"TCP port must be tcp://HOST:PORT, got {port}")
+    host, port_text = tail.rsplit(":", 1)
+    if not host:
+        host = default_windows_host_ip()
+    return host, int(port_text)
+
+
+class TcpByteStream:
+    def __init__(self, host: str, port: int, timeout: float, connect_timeout: float = 5.0):
+        self.host = host
+        self.port = port
+        self.sock = socket.create_connection((host, port), timeout=connect_timeout)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock.settimeout(timeout)
+        self.is_open = True
+
+    @property
+    def in_waiting(self) -> int:
+        readable, _, _ = select.select([self.sock], [], [], 0.0)
+        return 4096 if readable else 0
+
+    def read(self, size: int) -> bytes:
+        try:
+            data = self.sock.recv(size)
+        except socket.timeout:
+            return b""
+        if not data:
+            self.is_open = False
+            raise ConnectionError(f"TCP bridge closed tcp://{self.host}:{self.port}")
+        return data
+
+    def write(self, data: bytes) -> int:
+        self.sock.sendall(data)
+        return len(data)
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.is_open = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def open_byte_stream(port: str, baud: int, timeout: float) -> Any:
+    tcp_target = parse_tcp_port_spec(port)
+    if tcp_target is not None:
+        host, tcp_port = tcp_target
+        return TcpByteStream(host, tcp_port, timeout=timeout)
+    return serial.Serial(port, baud, timeout=timeout)
+
+
+def format_port_spec(port: str) -> str:
+    try:
+        normalized = normalize_port_spec(port)
+    except Exception:
+        return port
+    if normalized == port:
+        return port
+    return f"{port} -> {normalized}"
 
 
 def sample_host_clock() -> Tuple[float, float, float]:
@@ -152,7 +279,7 @@ def pressure_range_to_setf(pressure_range: str) -> Optional[str]:
     return mapping[pressure_range]
 
 
-def configure_pressure_sensor_range(ser: serial.Serial, pressure_range: str, suffix: bytes) -> None:
+def configure_pressure_sensor_range(ser: Any, pressure_range: str, suffix: bytes) -> None:
     cmd_setf = pressure_range_to_setf(pressure_range)
     if cmd_setf is None:
         print("[PRESSURE] Skip range config")
@@ -297,7 +424,7 @@ class SerialIngestThread(threading.Thread):
         baud: int,
         out_q: queue.Queue,
         stop_event: threading.Event,
-        on_open: Optional[Callable[[serial.Serial], None]] = None,
+        on_open: Optional[Callable[[Any], None]] = None,
         read_chunk: int = 4096,
         timeout: float = 0.01,
         stats: Optional[dict] = None,
@@ -312,22 +439,26 @@ class SerialIngestThread(threading.Thread):
         self.read_chunk = read_chunk
         self.timeout = timeout
         self.stats = stats if stats is not None else {}
-        self.ser: Optional[serial.Serial] = None
+        self.ser: Optional[Any] = None
 
     def run(self) -> None:
         try:
-            self.ser = serial.Serial(self.port, self.baud, timeout=self.timeout)
-            print(f"[{self.name}] Opened {self.port} @ {self.baud}")
+            self.ser = open_byte_stream(self.port, self.baud, timeout=self.timeout)
+            print(f"[{self.name}] Opened {format_port_spec(self.port)} @ {self.baud}")
             if self.on_open is not None:
                 self.on_open(self.ser)
         except Exception as e:
-            print(f"[{self.name}] Failed to open {self.port}: {e}")
+            print(f"[{self.name}] Failed to open {format_port_spec(self.port)}: {e}")
             return
 
         try:
             while not self.stop_event.is_set():
-                n = self.ser.in_waiting
-                chunk = self.ser.read(min(self.read_chunk, n) if n > 0 else 1)
+                try:
+                    n = self.ser.in_waiting
+                    chunk = self.ser.read(min(self.read_chunk, n) if n > 0 else 1)
+                except Exception as e:
+                    print(f"[{self.name}] Read failed on {self.port}: {e}")
+                    break
                 if not chunk:
                     continue
                 host_wall_ts_s, host_ts, _clock_span_s = sample_host_clock()
@@ -996,16 +1127,21 @@ def qmatrix_from_rot3(rot: np.ndarray, QtGui):
 
 
 def main() -> None:
-    if os.name != "nt":
-        raise RuntimeError("This script is Windows-only. Please run it in native Windows terminal.")
-
-    ap = argparse.ArgumentParser(description="Windows high-performance dual sensor parser")
-    ap.add_argument("--pressure-port", default="COM8")
+    ap = argparse.ArgumentParser(description="Cross-platform high-performance dual sensor parser")
+    ap.add_argument(
+        "--pressure-port",
+        default=None,
+        help="COM port or tcp://HOST:PORT. Default: COM10 on Windows, wintcp://17010 on WSL.",
+    )
     ap.add_argument("--pressure-baud", type=int, default=115200)
     ap.add_argument("--pressure-range", default="1kg", choices=["1kg", "3kg", "5kg", "10kg", "20kg", "30kg", "50kg", "skip"])
     ap.add_argument("--pressure-cmd-suffix", default="cr", choices=["none", "cr", "lf", "crlf"])
 
-    ap.add_argument("--imu-port", default="COM4")
+    ap.add_argument(
+        "--imu-port",
+        default=None,
+        help="COM port or tcp://HOST:PORT. Default: COM4 on Windows, wintcp://17004 on WSL.",
+    )
     ap.add_argument("--imu-baud", type=int, default=115200)
     ap.add_argument("--disable-imu", action="store_true")
     ap.add_argument("--imu-quat-world-to-sensor", action="store_true")
@@ -1037,6 +1173,11 @@ def main() -> None:
     ap.add_argument("--vmax", type=float, default=1000.0)
     ap.add_argument("--queue-size", type=int, default=4096)
     ap.add_argument("--read-chunk", type=int, default=4096)
+    ap.add_argument(
+        "--windows-host",
+        default=None,
+        help="Override the Windows host IP used by wintcp://PORT, e.g. --windows-host 172.22.128.1.",
+    )
 
     ap.add_argument("--racket-obj", default=str(DEFAULT_RACKET_OBJ))
     ap.add_argument("--no-racket-obj", action="store_true")
@@ -1045,6 +1186,14 @@ def main() -> None:
     ap.add_argument("--racket-align-pitch", type=float, default=0.0)
     ap.add_argument("--racket-align-yaw", type=float, default=0.0)
     args = ap.parse_args()
+
+    if args.windows_host:
+        os.environ["WSL_WINDOWS_HOST"] = args.windows_host
+
+    if args.pressure_port is None:
+        args.pressure_port = "wintcp://17010" if is_wsl() else "COM10"
+    if args.imu_port is None:
+        args.imu_port = "wintcp://17004" if is_wsl() else "COM4"
 
     requested_opengl_mode = normalize_requested_opengl_mode(args.opengl_mode, args.no_opengl)
     qt_opengl_mode = effective_qt_opengl_mode(requested_opengl_mode, args._opengl_retried)
@@ -1339,7 +1488,7 @@ def main() -> None:
 
     suffix_map = {"none": b"", "cr": b"\r", "lf": b"\n", "crlf": b"\r\n"}
 
-    def on_pressure_open(ser: serial.Serial):
+    def on_pressure_open(ser: Any):
         configure_pressure_sensor_range(ser, args.pressure_range, suffix_map[args.pressure_cmd_suffix])
 
     q_pressure: queue.Queue = queue.Queue(maxsize=args.queue_size)
@@ -1392,9 +1541,9 @@ def main() -> None:
     if imu_parse is not None:
         imu_parse.start()
 
-    imu_desc = "DISABLED" if args.disable_imu else f"{args.imu_port}@{args.imu_baud}"
+    imu_desc = "DISABLED" if args.disable_imu else f"{args.imu_port} @ {args.imu_baud}"
     print(
-        f"Running | Pressure {args.pressure_port}@{args.pressure_baud} range={args.pressure_range} "
+        f"Running | Pressure {args.pressure_port} @ {args.pressure_baud} range={args.pressure_range} "
         f"| IMU {imu_desc} | OpenGL request={requested_opengl_mode} qt={qt_opengl_mode}"
     )
 

@@ -1,6 +1,6 @@
 # 双设备串口解包与可视化（M1616M + TB100）
 
-脚本：`run_dual_sensor.py`
+脚本：`run_dual_sensor_sage.py`
 
 ## 功能
 
@@ -13,64 +13,112 @@
 
 ## 环境
 
-```bash
-pip install pyserial numpy matplotlib
-```
+WSL 侧使用你的 SAGE 环境：
 
-> 说明：你的环境里如果没有 `pip`，可先用你自己的 Python 环境（conda / venv）安装依赖后再运行。
+```bash
+conda activate SAGE
+```
 
 ## 运行示例（Windows）
 
 ```bash
-python run_dual_sensor.py \
-  --pressure-port COM8 \
+python run_dual_sensor_sage.py \
+  --pressure-port COM10 \
   --imu-port COM4 \
   --pressure-range 1kg \
-  --save-csv synced_output.csv
+  --save-csv output
 ```
 
-- `--pressure-port` 必填（请改成压力传感器蓝牙串口）
+- `--pressure-port` 默认 Windows 下为 `COM10`
 - `--imu-port` 默认 `COM4`
 - 默认波特率：
   - 压力传感器：`115200`
   - TB100：`115200`
 
-## 在 WSL 运行（重点）
+## 在 WSL2 运行（重点）
 
-- 现在脚本支持在 Linux/WSL 下直接写 `COMx`，会自动映射：
-  - `COM8 -> /dev/ttyS7`
-  - `COM4 -> /dev/ttyS3`
-- 若 WSL 直连 `/dev/ttyS*` 报 `Input/output error`，`run_dual_sensor.py` 会自动回退到 `wincom://COMx`（通过 `win_serial_stdio.py` 走 Windows 串口）。
+WSL2 不稳定支持直接打开 Windows 蓝牙串口或 USB 转串口。推荐路径是：
+
+1. Windows 原生进程打开 `COM10` / `COM4`
+2. Windows 侧转发为 TCP
+3. WSL 侧 `run_dual_sensor_sage.py` 连接 TCP 并继续做解析、同步、保存和可视化
+
+### 1. Windows 侧启动串口桥
+
+在 Windows Terminal / PowerShell 中进入仓库目录：
+
+```powershell
+cd D:\a_WORK\Projects\PhD\tasks\badminton
+python .\win_com_tcp_bridge.py --pressure-com COM10 --imu-com COM4
+```
+
+默认桥接：
+
+- 压力传感器：`COM10 -> tcp://0.0.0.0:17010`
+- IMU：`COM4 -> tcp://0.0.0.0:17004`
+
+也可以从 WSL 里启动 Windows 侧 Python：
+
+```bash
+powershell.exe -NoProfile -Command "cd 'D:\a_WORK\Projects\PhD\tasks\badminton'; python .\win_com_tcp_bridge.py --pressure-com COM10 --imu-com COM4"
+```
+
+如果 Windows 防火墙弹窗，需要允许该 Python 进程在专用网络上监听。
+
+### 2. WSL 侧运行采集/可视化
+
+`wintcp://PORT` 会自动从 WSL 中解析 Windows host IP：
+
+```bash
+conda activate SAGE
+python run_dual_sensor_sage.py \
+  --pressure-port wintcp://17010 \
+  --imu-port wintcp://17004 \
+  --pressure-range 1kg \
+  --save-csv output
+```
+
+在 WSL 中不传端口时，脚本默认也是：
+
+- `--pressure-port wintcp://17010`
+- `--imu-port wintcp://17004`
 
 示例（仅压力调试）：
 
 ```bash
-python -u run_dual_sensor.py --pressure-range 1kg --disable-imu
+python -u run_dual_sensor_sage.py --disable-imu --headless --pressure-range 1kg
 ```
 
-示例（双设备）：
+如果自动 Windows host IP 解析失败，手动查 Windows host IP：
 
 ```bash
-python -u run_dual_sensor.py --pressure-port COM8 --imu-port COM4 --pressure-range 1kg
+ip route | awk '/default/ {print $3; exit}'
 ```
 
-如果你希望显式使用桥接（而不是自动回退），可用性能脚本：
+然后显式传 `tcp://IP:PORT`：
 
 ```bash
 python run_dual_sensor_sage.py \
-  --pressure-port wincom://COM8 \
-  --imu-port wincom://COM4 \
-  --win-python /mnt/c/Users/Lizhou/.conda/envs/SAGE/python.exe
-
-# 仅调试压力（暂不接 IMU）
-python run_dual_sensor_sage.py \
-  --pressure-port wincom://COM8 \
-  --disable-imu \
-  --headless \
-  --pressure-cmd-suffix cr
+  --pressure-port tcp://172.xx.xx.1:17010 \
+  --imu-port tcp://172.xx.xx.1:17004
 ```
 
-该模式下：采集逻辑仍在 WSL 跑，但串口由 Windows 子进程打开，更稳定。
+也可以继续使用 `wintcp://PORT`，但显式覆盖 Windows host：
+
+```bash
+python run_dual_sensor_sage.py \
+  --windows-host 172.xx.xx.1 \
+  --pressure-port wintcp://17010 \
+  --imu-port wintcp://17004
+```
+
+如果 WSL 侧报 `timed out`，Windows 桥已经显示 `listening`，优先检查：
+
+1. Windows 防火墙是否允许当前 Python 监听 `17010` / `17004`
+2. WSL 中 `ip route | awk '/default/ {print $3; exit}'` 得到的 IP 是否能连通
+3. 是否有 VPN / 安全软件拦截 WSL2 虚拟网卡到 Windows host 的 TCP 连接
+
+该模式下：串口独占打开和蓝牙/USB 驱动都留在 Windows，WSL 只接收原始字节流并做原有解析与可视化。
 
 ## 可选参数
 

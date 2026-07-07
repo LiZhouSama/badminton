@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 
-DEFAULT_BODY_MODEL = Path("/mnt/d/a_WORK/Projects/PhD/datasets/smpl_models/smplh/neutral/model.npz")
+DEFAULT_BODY_MODEL = Path("../../datasets/smpl_models/smplh/neutral/model.npz")
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,10 +39,11 @@ def select_device(device_arg: str) -> torch.device:
 
 def load_body_model(body_model_path: Path, num_betas: int, device: torch.device):
     from human_body_prior.body_model.body_model import BodyModel
+    from xsens_mvn_csv_to_smplh import instantiate_body_model
 
     if not body_model_path.exists():
         raise FileNotFoundError(f"SMPL-H body model not found: {body_model_path}")
-    model = BodyModel(bm_fname=str(body_model_path), num_betas=num_betas)
+    model = instantiate_body_model(BodyModel, body_model_path, num_betas)
     model = model.to(device)
     model.eval()
     return model
@@ -154,6 +155,8 @@ def forward_vertices(
     device: torch.device,
     batch_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    from xsens_mvn_csv_to_smplh import body_model_output_tensor, call_body_model
+
     pose_body = data["pose_body"]
     pose_hand = data["pose_hand"]
     root_orient = data["root_orient"]
@@ -165,15 +168,16 @@ def forward_vertices(
     with torch.no_grad():
         for start in range(0, pose_body.shape[0], batch_size):
             end = min(start + batch_size, pose_body.shape[0])
-            out = body_model(
+            out = call_body_model(
+                body_model,
                 pose_body=pose_body[start:end].to(device),
                 pose_hand=pose_hand[start:end].to(device),
                 betas=betas[start:end].to(device),
                 root_orient=root_orient[start:end].to(device),
                 trans=trans[start:end].to(device),
             )
-            vertices.append(out.v.detach().cpu().numpy().astype(np.float32))
-            joints.append(out.Jtr.detach().cpu().numpy().astype(np.float32))
+            vertices.append(body_model_output_tensor(out, "v", "vertices").detach().cpu().numpy().astype(np.float32))
+            joints.append(body_model_output_tensor(out, "Jtr", "joints").detach().cpu().numpy().astype(np.float32))
     return np.concatenate(vertices, axis=0), np.concatenate(joints, axis=0)
 
 

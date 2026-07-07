@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import queue
 import signal
 import threading
@@ -40,10 +41,12 @@ from xsens_mvn_csv_to_smplh import (
     FramePose,
     RetargetConfig,
     SegmentPose,
+    body_model_output_tensor,
     body_model_rest_joints,
     build_smpl24_global_rotmats,
     build_hand_retarget_cache,
     build_smplh_global_rotmats,
+    call_body_model,
     check_rotation_orthogonality,
     compute_trans_from_pelvis,
     create_body_model,
@@ -82,9 +85,12 @@ class SharedRealtimeState:
         self.counters: Counter = Counter()
         self.latest_vertices: Optional[np.ndarray] = None
         self.latest_vertices_sample_counter: Optional[int] = None
+        self.latest_vertices_host_wall_ts_s: Optional[float] = None
+        self.latest_vertices_host_perf_ts_s: Optional[float] = None
         self.latest_sample_counter: Optional[int] = None
         self.latest_time_code_ms: Optional[int] = None
         self.latest_host_wall_ts_s: Optional[float] = None
+        self.latest_host_perf_ts_s: Optional[float] = None
         self.latest_error: str = ""
         self.capture_stats: Optional[Dict[str, int]] = None
         self.final_pt_path: Optional[Path] = None
@@ -183,14 +189,15 @@ class RealtimeSmplhRetargeter:
         betas: np.ndarray,
     ) -> np.ndarray:
         with torch.no_grad():
-            out = self.body_model(
+            out = call_body_model(
+                self.body_model,
                 pose_body=torch.from_numpy(pose_body).to(self.device),
                 pose_hand=torch.from_numpy(pose_hand).to(self.device),
                 betas=torch.from_numpy(betas).to(self.device),
                 root_orient=torch.from_numpy(root_orient.astype(np.float32)).to(self.device),
                 trans=torch.from_numpy(trans).to(self.device),
             )
-        return out.v[0].detach().cpu().numpy().astype(np.float32)
+        return body_model_output_tensor(out, "v", "vertices")[0].detach().cpu().numpy().astype(np.float32)
 
     def metadata(self, source_pose_csv: Path) -> Dict[str, object]:
         return {
@@ -391,6 +398,15 @@ def smplh_vertices_to_pyqtgraph(vertices: np.ndarray) -> np.ndarray:
     return display_vertices
 
 
+def windows_udp_destination_hint() -> str:
+    return (
+        "Windows UDP hint: in Xsens Network Streamer, set Host to 127.0.0.1 when MVN and this "
+        "script run on this Windows PC, or to the physical Windows adapter IPv4 from ipconfig when "
+        "streaming from another machine. Uncheck Send Paused. 0.0.0.0 is only a bind/listen address, "
+        "not a useful destination host; do not use the WSL 172.x address for Windows Python."
+    )
+
+
 def build_capture_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         bind_ip=args.bind_ip,
@@ -525,9 +541,12 @@ def retarget_worker(
                     state.latest_sample_counter = smplh_frame.sample_counter
                     state.latest_time_code_ms = smplh_frame.time_code_ms
                     state.latest_host_wall_ts_s = smplh_frame.host_wall_ts_s
+                    state.latest_host_perf_ts_s = smplh_frame.host_perf_ts_s
                     if smplh_frame.vertices is not None:
                         state.latest_vertices = smplh_frame.vertices
                         state.latest_vertices_sample_counter = smplh_frame.sample_counter
+                        state.latest_vertices_host_wall_ts_s = smplh_frame.host_wall_ts_s
+                        state.latest_vertices_host_perf_ts_s = smplh_frame.host_perf_ts_s
                         state.counters["mesh_frames"] += 1
                         last_mesh_s = now_s
 
@@ -715,10 +734,24 @@ def run_pyqtgraph_viewer(
     app.exec()
 
 
-def main() -> None:
-    args = parse_args()
+@dataclass
+class RealtimeSmplhRuntime:
+    args: argparse.Namespace
+    stop_event: threading.Event
+    state: SharedRealtimeState
+    pose_queue: "queue.Queue[List[Dict[str, object]]]"
+    start_s: float
+    retargeter: RealtimeSmplhRetargeter
+    capture_thread: threading.Thread
+    retarget_thread: threading.Thread
+
+
+def create_realtime_runtime(
+    args: argparse.Namespace,
+    stop_event: Optional[threading.Event] = None,
+) -> RealtimeSmplhRuntime:
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    stop_event = threading.Event()
+    runtime_stop_event = stop_event or threading.Event()
     state = SharedRealtimeState()
     pose_queue: "queue.Queue[List[Dict[str, object]]]" = queue.Queue(maxsize=max(1, args.retarget_queue_size))
     start_s = time.monotonic()
@@ -733,41 +766,101 @@ def main() -> None:
         ),
     )
 
-    def request_stop(_signum: int, _frame: object) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
-
     capture_thread = threading.Thread(
         target=capture_worker,
-        args=(args, pose_queue, stop_event, state),
+        args=(args, pose_queue, runtime_stop_event, state),
         name="xsens-udp-capture",
         daemon=True,
     )
     retarget_thread = threading.Thread(
         target=retarget_worker,
-        args=(args, retargeter, pose_queue, stop_event, state),
+        args=(args, retargeter, pose_queue, runtime_stop_event, state),
         name="xsens-smplh-retarget",
         daemon=True,
     )
+    return RealtimeSmplhRuntime(
+        args=args,
+        stop_event=runtime_stop_event,
+        state=state,
+        pose_queue=pose_queue,
+        start_s=start_s,
+        retargeter=retargeter,
+        capture_thread=capture_thread,
+        retarget_thread=retarget_thread,
+    )
 
-    print(f"[REALTIME] Listening on {args.bind_ip}:{args.port}", flush=True)
-    print(f"[REALTIME] CSV output: {args.output_dir}", flush=True)
-    print(f"[REALTIME] PT output: {args.pt_output or (args.output_dir / 'xsens_mvn_smplh_realtime.pt')}", flush=True)
-    capture_thread.start()
-    retarget_thread.start()
+
+def start_realtime_runtime(runtime: RealtimeSmplhRuntime, print_banner: bool = True) -> None:
+    args = runtime.args
+    if print_banner:
+        print(f"[REALTIME] Listening on {args.bind_ip}:{args.port}", flush=True)
+        print(f"[REALTIME] CSV output: {args.output_dir}", flush=True)
+        print(f"[REALTIME] PT output: {args.pt_output or (args.output_dir / 'xsens_mvn_smplh_realtime.pt')}", flush=True)
+        if platform.system() == "Windows":
+            print(f"[REALTIME] {windows_udp_destination_hint()}", flush=True)
+    runtime.capture_thread.start()
+    runtime.retarget_thread.start()
+
+
+def stop_realtime_runtime(
+    runtime: RealtimeSmplhRuntime,
+    print_final: bool = True,
+    capture_join_timeout: float = 2.0,
+    retarget_join_timeout: float = 10.0,
+) -> None:
+    runtime.stop_event.set()
+    if runtime.capture_thread.ident is not None:
+        runtime.capture_thread.join(timeout=capture_join_timeout)
+    if runtime.retarget_thread.ident is not None:
+        runtime.retarget_thread.join(timeout=retarget_join_timeout)
+    if not print_final:
+        return
+    print(
+        "[REALTIME] "
+        + " | ".join(make_status_lines(runtime.state, runtime.pose_queue, runtime.start_s)),
+        flush=True,
+    )
+    with runtime.state.lock:
+        capture_stats = dict(runtime.state.capture_stats) if runtime.state.capture_stats is not None else None
+    if platform.system() == "Windows" and capture_stats is not None and capture_stats.get("packets", 0) == 0:
+        print(f"[REALTIME] No UDP packets received. {windows_udp_destination_hint()}", flush=True)
+
+
+def main() -> None:
+    args = parse_args()
+    runtime = create_realtime_runtime(args)
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        runtime.stop_event.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+
+    start_realtime_runtime(runtime)
 
     try:
         if args.viewer == "none":
-            run_headless(args, pose_queue, stop_event, state, capture_thread, retarget_thread, start_s)
+            run_headless(
+                args,
+                runtime.pose_queue,
+                runtime.stop_event,
+                runtime.state,
+                runtime.capture_thread,
+                runtime.retarget_thread,
+                runtime.start_s,
+            )
         else:
-            run_pyqtgraph_viewer(args, retargeter, pose_queue, stop_event, state, retarget_thread, start_s)
+            run_pyqtgraph_viewer(
+                args,
+                runtime.retargeter,
+                runtime.pose_queue,
+                runtime.stop_event,
+                runtime.state,
+                runtime.retarget_thread,
+                runtime.start_s,
+            )
     finally:
-        stop_event.set()
-        capture_thread.join(timeout=2.0)
-        retarget_thread.join(timeout=10.0)
-        print("[REALTIME] " + " | ".join(make_status_lines(state, pose_queue, start_s)), flush=True)
+        stop_realtime_runtime(runtime)
 
 
 if __name__ == "__main__":

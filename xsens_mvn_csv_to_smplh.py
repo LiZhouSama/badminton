@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
+import inspect
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,10 +22,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 
 
-DEFAULT_BODY_MODEL = Path("/mnt/d/a_WORK/Projects/PhD/datasets/smpl_models/smplh/neutral/model.npz")
+DEFAULT_BODY_MODEL = Path("../../datasets/smpl_models/smplh/neutral/model.npz")
 
 XSENS_ZUP_TO_SMPL = np.array(
     [
@@ -182,8 +183,15 @@ MVN_BODY_TO_SMPL24 = {
 
 LEFT_ARM_SEGMENTS = {"Left Upper Arm", "Left Forearm", "Left Hand"}
 RIGHT_ARM_SEGMENTS = {"Right Upper Arm", "Right Forearm", "Right Hand"}
-LEFT_ARM_CORRECTION = Rotation.from_euler("x", 90.0, degrees=True).as_matrix().astype(np.float32)
-RIGHT_ARM_CORRECTION = Rotation.from_euler("x", 90.0, degrees=True).as_matrix().astype(np.float32)
+LEFT_ARM_CORRECTION = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=np.float32,
+)
+RIGHT_ARM_CORRECTION = LEFT_ARM_CORRECTION.copy()
 WRIST_TWIST_LIMIT_DEG = 60.0
 
 LEFT_HAND_JOINT_MVN_PAIRS = {
@@ -378,6 +386,151 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
+def matmul3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.sum(np.expand_dims(a, axis=-1) * np.expand_dims(b, axis=-3), axis=-2)
+
+
+def matvec3(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.sum(a * np.expand_dims(b, axis=-2), axis=-1)
+
+
+def det3(rotmats: np.ndarray) -> np.ndarray:
+    mats = np.asarray(rotmats)
+    return (
+        mats[..., 0, 0] * (mats[..., 1, 1] * mats[..., 2, 2] - mats[..., 1, 2] * mats[..., 2, 1])
+        - mats[..., 0, 1] * (mats[..., 1, 0] * mats[..., 2, 2] - mats[..., 1, 2] * mats[..., 2, 0])
+        + mats[..., 0, 2] * (mats[..., 1, 0] * mats[..., 2, 1] - mats[..., 1, 1] * mats[..., 2, 0])
+    )
+
+
+def quat_xyzw_to_rotmat(quats: np.ndarray) -> np.ndarray:
+    quats = np.asarray(quats, dtype=np.float64)
+    if quats.shape[-1] != 4:
+        raise ValueError(f"Expected quaternion shape [...,4], got {quats.shape}")
+    out_shape = quats.shape[:-1] + (3, 3)
+    flat = quats.reshape(-1, 4).copy()
+    norms = np.linalg.norm(flat, axis=1, keepdims=True)
+    if np.any(~np.isfinite(norms)) or np.any(norms < 1e-8):
+        raise ValueError("Invalid zero or non-finite quaternion")
+    flat /= norms
+
+    x = flat[:, 0]
+    y = flat[:, 1]
+    z = flat[:, 2]
+    w = flat[:, 3]
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    wx = w * x
+    wy = w * y
+    wz = w * z
+
+    rotmats = np.empty((flat.shape[0], 3, 3), dtype=np.float64)
+    rotmats[:, 0, 0] = 1.0 - 2.0 * (yy + zz)
+    rotmats[:, 0, 1] = 2.0 * (xy - wz)
+    rotmats[:, 0, 2] = 2.0 * (xz + wy)
+    rotmats[:, 1, 0] = 2.0 * (xy + wz)
+    rotmats[:, 1, 1] = 1.0 - 2.0 * (xx + zz)
+    rotmats[:, 1, 2] = 2.0 * (yz - wx)
+    rotmats[:, 2, 0] = 2.0 * (xz - wy)
+    rotmats[:, 2, 1] = 2.0 * (yz + wx)
+    rotmats[:, 2, 2] = 1.0 - 2.0 * (xx + yy)
+    return rotmats.astype(np.float32).reshape(out_shape)
+
+
+def rotmat_to_quat_xyzw(rotmats: np.ndarray) -> np.ndarray:
+    rotmats = np.asarray(rotmats, dtype=np.float64)
+    if rotmats.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrix shape [...,3,3], got {rotmats.shape}")
+    out_shape = rotmats.shape[:-2] + (4,)
+    mats = rotmats.reshape(-1, 3, 3)
+    quats = np.empty((mats.shape[0], 4), dtype=np.float64)
+
+    m00 = mats[:, 0, 0]
+    m01 = mats[:, 0, 1]
+    m02 = mats[:, 0, 2]
+    m10 = mats[:, 1, 0]
+    m11 = mats[:, 1, 1]
+    m12 = mats[:, 1, 2]
+    m20 = mats[:, 2, 0]
+    m21 = mats[:, 2, 1]
+    m22 = mats[:, 2, 2]
+    trace = m00 + m11 + m22
+
+    mask = trace > 0.0
+    s = np.sqrt(np.maximum(trace[mask] + 1.0, 0.0)) * 2.0
+    quats[mask, 3] = 0.25 * s
+    quats[mask, 0] = (m21[mask] - m12[mask]) / s
+    quats[mask, 1] = (m02[mask] - m20[mask]) / s
+    quats[mask, 2] = (m10[mask] - m01[mask]) / s
+
+    mask_x = ~mask & (m00 > m11) & (m00 > m22)
+    s = np.sqrt(np.maximum(1.0 + m00[mask_x] - m11[mask_x] - m22[mask_x], 0.0)) * 2.0
+    quats[mask_x, 3] = (m21[mask_x] - m12[mask_x]) / s
+    quats[mask_x, 0] = 0.25 * s
+    quats[mask_x, 1] = (m01[mask_x] + m10[mask_x]) / s
+    quats[mask_x, 2] = (m02[mask_x] + m20[mask_x]) / s
+
+    mask_y = ~mask & ~mask_x & (m11 > m22)
+    s = np.sqrt(np.maximum(1.0 + m11[mask_y] - m00[mask_y] - m22[mask_y], 0.0)) * 2.0
+    quats[mask_y, 3] = (m02[mask_y] - m20[mask_y]) / s
+    quats[mask_y, 0] = (m01[mask_y] + m10[mask_y]) / s
+    quats[mask_y, 1] = 0.25 * s
+    quats[mask_y, 2] = (m12[mask_y] + m21[mask_y]) / s
+
+    mask_z = ~mask & ~mask_x & ~mask_y
+    s = np.sqrt(np.maximum(1.0 + m22[mask_z] - m00[mask_z] - m11[mask_z], 0.0)) * 2.0
+    quats[mask_z, 3] = (m10[mask_z] - m01[mask_z]) / s
+    quats[mask_z, 0] = (m02[mask_z] + m20[mask_z]) / s
+    quats[mask_z, 1] = (m12[mask_z] + m21[mask_z]) / s
+    quats[mask_z, 2] = 0.25 * s
+
+    norms = np.linalg.norm(quats, axis=1, keepdims=True)
+    if np.any(~np.isfinite(norms)) or np.any(norms < 1e-8):
+        raise ValueError("Could not convert rotation matrix to a valid quaternion")
+    quats /= norms
+    return quats.astype(np.float32).reshape(out_shape)
+
+
+def rotvec_to_rotmat(rotvecs: np.ndarray) -> np.ndarray:
+    rotvecs = np.asarray(rotvecs, dtype=np.float64)
+    if rotvecs.shape[-1] != 3:
+        raise ValueError(f"Expected rotvec shape [...,3], got {rotvecs.shape}")
+    out_shape = rotvecs.shape[:-1] + (3, 3)
+    flat = rotvecs.reshape(-1, 3)
+    angles = np.linalg.norm(flat, axis=1)
+    rotmats = np.tile(np.eye(3, dtype=np.float64), (flat.shape[0], 1, 1))
+    valid = angles > 1e-8
+    if np.any(valid):
+        axes = flat[valid] / angles[valid, None]
+        x = axes[:, 0]
+        y = axes[:, 1]
+        z = axes[:, 2]
+        zeros = np.zeros_like(x)
+        k = np.stack(
+            [
+                zeros,
+                -z,
+                y,
+                z,
+                zeros,
+                -x,
+                -y,
+                x,
+                zeros,
+            ],
+            axis=1,
+        ).reshape(-1, 3, 3)
+        sin_angle = np.sin(angles[valid])[:, None, None]
+        cos_angle = np.cos(angles[valid])[:, None, None]
+        eye = np.eye(3, dtype=np.float64)[None, :, :]
+        rotmats[valid] = eye + sin_angle * k + (1.0 - cos_angle) * matmul3(k, k)
+    return rotmats.astype(np.float32).reshape(out_shape)
+
+
 def quat_wxyz_to_rotmat(row: Dict[str, str]) -> np.ndarray:
     quat_wxyz = np.array(
         [float(row["q_w"]), float(row["q_x"]), float(row["q_y"]), float(row["q_z"])],
@@ -388,7 +541,7 @@ def quat_wxyz_to_rotmat(row: Dict[str, str]) -> np.ndarray:
         raise ValueError(f"Invalid quaternion at sample {row.get('sample_counter')}: {quat_wxyz}")
     quat_wxyz /= norm
     quat_xyzw = np.array([quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64)
-    return Rotation.from_quat(quat_xyzw).as_matrix().astype(np.float32)
+    return quat_xyzw_to_rotmat(quat_xyzw)
 
 
 def position_m_from_row(row: Dict[str, str]) -> np.ndarray:
@@ -413,13 +566,13 @@ def validate_coordinate_system(coordinate_system: str) -> None:
 def convert_rotmat_coord(rotmat: np.ndarray, coordinate_system: str) -> np.ndarray:
     validate_coordinate_system(coordinate_system)
     rotmat = rotmat.astype(np.float32, copy=False)
-    return (XSENS_ZUP_TO_SMPL @ rotmat @ XSENS_ZUP_TO_SMPL.T).astype(np.float32)
+    return matmul3(matmul3(XSENS_ZUP_TO_SMPL, rotmat), XSENS_ZUP_TO_SMPL.T).astype(np.float32)
 
 
 def convert_position_coord(position: np.ndarray, coordinate_system: str) -> np.ndarray:
     validate_coordinate_system(coordinate_system)
     position = position.astype(np.float32, copy=False)
-    return (XSENS_ZUP_TO_SMPL @ position).astype(np.float32)
+    return matvec3(XSENS_ZUP_TO_SMPL, position).astype(np.float32)
 
 
 def apply_arm_axis_correction(mvn_name: str, rotmat: np.ndarray, arm_correction: str) -> np.ndarray:
@@ -428,9 +581,9 @@ def apply_arm_axis_correction(mvn_name: str, rotmat: np.ndarray, arm_correction:
     if arm_correction != "xsens_ros2_plus90":
         raise ValueError(f"Unsupported arm correction mode: {arm_correction!r}")
     if mvn_name in LEFT_ARM_SEGMENTS:
-        return (rotmat @ LEFT_ARM_CORRECTION).astype(np.float32)
+        return matmul3(rotmat, LEFT_ARM_CORRECTION).astype(np.float32)
     if mvn_name in RIGHT_ARM_SEGMENTS:
-        return (rotmat @ RIGHT_ARM_CORRECTION).astype(np.float32)
+        return matmul3(rotmat, RIGHT_ARM_CORRECTION).astype(np.float32)
     return rotmat
 
 
@@ -551,7 +704,7 @@ def global_to_local_rotmats(global_rotmats: np.ndarray, parents: np.ndarray) -> 
         if parent_idx < 0:
             local[:, joint_idx] = global_rotmats[:, joint_idx]
         else:
-            local[:, joint_idx] = np.matmul(
+            local[:, joint_idx] = matmul3(
                 np.swapaxes(global_rotmats[:, parent_idx], -1, -2),
                 global_rotmats[:, joint_idx],
             )
@@ -568,7 +721,7 @@ def local_to_global_rotmats(local_rotmats: np.ndarray, parents: np.ndarray) -> n
         if parent_idx < 0:
             global_rotmats[:, joint_idx] = local_rotmats[:, joint_idx]
         else:
-            global_rotmats[:, joint_idx] = np.matmul(
+            global_rotmats[:, joint_idx] = matmul3(
                 global_rotmats[:, parent_idx],
                 local_rotmats[:, joint_idx],
             )
@@ -582,7 +735,7 @@ def rotation_angles_deg(rotmats: np.ndarray) -> np.ndarray:
 
 
 def relative_rotation_error_deg(reference: np.ndarray, estimate: np.ndarray) -> np.ndarray:
-    relative = np.matmul(np.swapaxes(reference, -1, -2), estimate)
+    relative = matmul3(np.swapaxes(reference, -1, -2), estimate)
     return rotation_angles_deg(relative)
 
 
@@ -631,7 +784,8 @@ def remove_twist_around_axis(rotmats: np.ndarray, axis: np.ndarray) -> np.ndarra
     axis = axis / axis_norm
 
     flat_shape = rotmats.shape[:-2]
-    quats = Rotation.from_matrix(rotmats.reshape(-1, 3, 3)).as_quat()
+    flat_rotmats = rotmats.reshape(-1, 3, 3)
+    quats = rotmat_to_quat_xyzw(flat_rotmats).reshape(-1, 4).astype(np.float64)
     quat_vec = quats[:, :3]
     quat_w = quats[:, 3:4]
     twist_vec = np.sum(quat_vec * axis[None, :], axis=1, keepdims=True) * axis[None, :]
@@ -641,8 +795,9 @@ def remove_twist_around_axis(rotmats: np.ndarray, axis: np.ndarray) -> np.ndarra
     twist_quats[valid] /= twist_norms[valid]
     twist_quats[~valid] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
-    swing = Rotation.from_quat(quats) * Rotation.from_quat(twist_quats).inv()
-    return swing.as_matrix().astype(np.float32).reshape(flat_shape + (3, 3))
+    twist_rotmats = quat_xyzw_to_rotmat(twist_quats).reshape(-1, 3, 3)
+    swing = matmul3(flat_rotmats, np.swapaxes(twist_rotmats, -1, -2))
+    return swing.astype(np.float32).reshape(flat_shape + (3, 3))
 
 
 def clamp_twist_around_axis(rotmats: np.ndarray, axis: np.ndarray, max_angle_deg: float) -> np.ndarray:
@@ -653,7 +808,8 @@ def clamp_twist_around_axis(rotmats: np.ndarray, axis: np.ndarray, max_angle_deg
     axis = axis / axis_norm
 
     flat_shape = rotmats.shape[:-2]
-    quats = Rotation.from_matrix(rotmats.reshape(-1, 3, 3)).as_quat()
+    flat_rotmats = rotmats.reshape(-1, 3, 3)
+    quats = rotmat_to_quat_xyzw(flat_rotmats).reshape(-1, 4).astype(np.float64)
     flip = quats[:, 3] < 0.0
     quats[flip] *= -1.0
     quat_vec = quats[:, :3]
@@ -666,7 +822,6 @@ def clamp_twist_around_axis(rotmats: np.ndarray, axis: np.ndarray, max_angle_deg
     twist_quats[valid] /= twist_norms[valid]
     twist_quats[~valid] = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
-    swing = Rotation.from_quat(quats) * Rotation.from_quat(twist_quats).inv()
     signed_angles = 2.0 * np.arctan2(
         np.sum(twist_quats[:, :3] * axis[None, :], axis=1),
         twist_quats[:, 3],
@@ -674,8 +829,10 @@ def clamp_twist_around_axis(rotmats: np.ndarray, axis: np.ndarray, max_angle_deg
     signed_angles = (signed_angles + np.pi) % (2.0 * np.pi) - np.pi
     limit = np.deg2rad(max_angle_deg)
     clipped_angles = np.clip(signed_angles, -limit, limit)
-    clipped_twist = Rotation.from_rotvec(clipped_angles[:, None] * axis[None, :])
-    return (swing * clipped_twist).as_matrix().astype(np.float32).reshape(flat_shape + (3, 3))
+    twist_rotmats = quat_xyzw_to_rotmat(twist_quats).reshape(-1, 3, 3)
+    swing = matmul3(flat_rotmats, np.swapaxes(twist_rotmats, -1, -2))
+    clipped_twist = rotvec_to_rotmat(clipped_angles[:, None] * axis[None, :]).reshape(-1, 3, 3)
+    return matmul3(swing, clipped_twist).astype(np.float32).reshape(flat_shape + (3, 3))
 
 
 def rest_bone_axis(rest_joints: np.ndarray, start_idx: int, end_idx: int) -> np.ndarray:
@@ -745,7 +902,7 @@ def axis_angle_rotmat_rad(axis: np.ndarray, angle_rad: float) -> np.ndarray:
     )
     sin_angle = np.sin(angle_rad)
     cos_angle = np.cos(angle_rad)
-    return (np.eye(3, dtype=np.float64) + sin_angle * k + (1.0 - cos_angle) * (k @ k)).astype(np.float32)
+    return (np.eye(3, dtype=np.float64) + sin_angle * k + (1.0 - cos_angle) * matmul3(k, k)).astype(np.float32)
 
 
 def rotation_between_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
@@ -753,12 +910,12 @@ def rotation_between_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarr
     target = normalize_vector(target, "rotation target")
     cross = np.cross(source, target).astype(np.float64)
     cross_norm = float(np.linalg.norm(cross))
-    dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
+    dot = float(np.clip(np.sum(source * target), -1.0, 1.0))
     if cross_norm < 1e-8:
         if dot > 0.0:
             return np.eye(3, dtype=np.float32)
         fallback = np.array([1.0, 0.0, 0.0], dtype=np.float32)
-        if abs(float(np.dot(source, fallback))) > 0.9:
+        if abs(float(np.sum(source * fallback))) > 0.9:
             fallback = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         axis = normalize_vector(np.cross(source, fallback), "antiparallel rotation axis")
         return axis_angle_rotmat_rad(axis, np.pi)
@@ -774,7 +931,7 @@ def rotation_between_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarr
     return (
         np.eye(3, dtype=np.float64)
         + k
-        + (k @ k) * ((1.0 - dot) / (cross_norm * cross_norm))
+        + matmul3(k, k) * ((1.0 - dot) / (cross_norm * cross_norm))
     ).astype(np.float32)
 
 
@@ -799,8 +956,8 @@ def remove_arm_twist_keep_measured_wrists(
         )
         adjusted[:, shoulder_idx] = shoulder_swing
 
-        new_shoulder_global = np.matmul(global_rotmats[:, parent_idx], shoulder_swing)
-        elbow_target_local = np.matmul(
+        new_shoulder_global = matmul3(global_rotmats[:, parent_idx], shoulder_swing)
+        elbow_target_local = matmul3(
             np.swapaxes(new_shoulder_global, -1, -2),
             global_rotmats[:, elbow_idx],
         )
@@ -837,8 +994,8 @@ def remove_arm_twist_preserve_measured_hand_global(
         )
         adjusted[:, shoulder_idx] = shoulder_swing
 
-        new_shoulder_global = np.matmul(global_rotmats[:, parent_idx], shoulder_swing)
-        elbow_target_local = np.matmul(
+        new_shoulder_global = matmul3(global_rotmats[:, parent_idx], shoulder_swing)
+        elbow_target_local = matmul3(
             np.swapaxes(new_shoulder_global, -1, -2),
             global_rotmats[:, elbow_idx],
         )
@@ -846,8 +1003,8 @@ def remove_arm_twist_preserve_measured_hand_global(
         elbow_swing = remove_twist_around_axis(elbow_target_local, lower_arm_axis)
         adjusted[:, elbow_idx] = elbow_swing
 
-        new_elbow_global = np.matmul(new_shoulder_global, elbow_swing)
-        adjusted[:, wrist_idx] = np.matmul(
+        new_elbow_global = matmul3(new_shoulder_global, elbow_swing)
+        adjusted[:, wrist_idx] = matmul3(
             np.swapaxes(new_elbow_global, -1, -2),
             global_rotmats[:, wrist_idx],
         )
@@ -855,9 +1012,20 @@ def remove_arm_twist_preserve_measured_hand_global(
 
 
 def matrix_to_axis_angle(rotmats: np.ndarray) -> np.ndarray:
-    return Rotation.from_matrix(rotmats.reshape(-1, 3, 3)).as_rotvec().astype(np.float32).reshape(
-        rotmats.shape[:-2] + (3,)
-    )
+    if rotmats.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrix shape [...,3,3], got {rotmats.shape}")
+    quats = rotmat_to_quat_xyzw(rotmats).reshape(-1, 4).astype(np.float64)
+    flip = quats[:, 3] < 0.0
+    quats[flip] *= -1.0
+    quat_vec = quats[:, :3]
+    quat_w = np.clip(quats[:, 3], -1.0, 1.0)
+    sin_half = np.linalg.norm(quat_vec, axis=1)
+    angles = 2.0 * np.arctan2(sin_half, quat_w)
+    rotvecs = np.zeros_like(quat_vec)
+    valid = sin_half > 1e-8
+    rotvecs[valid] = quat_vec[valid] * (angles[valid] / sin_half[valid])[:, None]
+    rotvecs[~valid] = 2.0 * quat_vec[~valid]
+    return rotvecs.astype(np.float32).reshape(rotmats.shape[:-2] + (3,))
 
 
 def read_smplh_parents(body_model_path: Path) -> np.ndarray:
@@ -917,7 +1085,7 @@ def finger_local_rotmat_for_smpl(frame: FramePose, joint_name: str) -> np.ndarra
     source = finger_source_for_joint(frame, joint_name)
     parent_global = finger_segment_rotmat_for_smpl(source[parent_mvn_name])
     child_global = finger_segment_rotmat_for_smpl(source[child_mvn_name])
-    return (parent_global.T @ child_global).astype(np.float32)
+    return matmul3(parent_global.T, child_global).astype(np.float32)
 
 
 def finger_positions_for_smpl(source: Dict[str, SegmentPose]) -> Dict[str, np.ndarray]:
@@ -938,7 +1106,7 @@ def thumb_swing_local_rotmat_for_smpl(
         source_positions[end_mvn_name] - source_positions[start_mvn_name],
         f"{joint_name} MVN thumb position direction",
     )
-    target_parent_local = parent_global.T @ target_global
+    target_parent_local = matvec3(parent_global.T, target_global)
     return rotation_between_vectors(rest_direction, target_parent_local)
 
 
@@ -953,7 +1121,7 @@ def finger_position_swing_local_rotmat_for_smpl(
         source_positions[end_mvn_name] - source_positions[start_mvn_name],
         f"{joint_name} MVN position direction",
     )
-    target_parent_local = parent_global.T @ target_global
+    target_parent_local = matvec3(parent_global.T, target_global)
     return rotation_between_vectors(rest_direction, target_parent_local)
 
 
@@ -972,7 +1140,7 @@ def stable_segment_long_axis_for_smpl(
         for axis_idx in range(3):
             axis = rotmat[:, axis_idx]
             for sign in (1.0, -1.0):
-                dot = float(np.dot(sign * axis, reference))
+                dot = float(np.sum(sign * axis * reference))
                 if dot > best_dot:
                     best_dot = dot
                     best_axis_idx = axis_idx
@@ -1000,7 +1168,7 @@ def finger_distal_axis_local_rotmat_for_smpl(
         axis_cache=hand_cache.distal_segment_axes,
         cache_key=joint_name,
     )
-    target_parent_local = parent_global.T @ target_global
+    target_parent_local = matvec3(parent_global.T, target_global)
     return rotation_between_vectors(rest_direction, target_parent_local)
 
 
@@ -1021,7 +1189,7 @@ def thumb_distal_local_rotmat_for_smpl(
         axis_cache=hand_cache.distal_segment_axes,
         cache_key=joint_name,
     )
-    target_parent_local = parent_global.T @ target_global
+    target_parent_local = matvec3(parent_global.T, target_global)
     return rotation_between_vectors(rest_direction, target_parent_local)
 
 
@@ -1101,7 +1269,7 @@ def build_smplh_global_rotmats(
                 rest_direction=hand_cache.rest_axes[joint_idx],
                 hand_cache=hand_cache,
             )
-            full[frame_idx, joint_idx] = (full[frame_idx, parent_idx] @ local).astype(np.float32)
+            full[frame_idx, joint_idx] = matmul3(full[frame_idx, parent_idx], local).astype(np.float32)
     return full
 
 
@@ -1120,8 +1288,65 @@ def compute_trans_from_pelvis(
         ],
         axis=0,
     ).astype(np.float32)
-    rotated_rest_root = Rotation.from_rotvec(root_orient).apply(rest_root).astype(np.float32)
+    root_rotmats = rotvec_to_rotmat(root_orient)
+    rotated_rest_root = matvec3(root_rotmats, rest_root.astype(np.float32)).astype(np.float32)
     return (pelvis_pos - rotated_rest_root).astype(np.float32)
+
+
+def instantiate_body_model(BodyModel, body_model_path: Path, num_betas: int):
+    patch_human_body_prior_lbs_dtype_compat()
+    model_path = str(body_model_path)
+    model_type = "smplh"
+    attempts = [
+        lambda: BodyModel(bm_fname=model_path, num_betas=num_betas),
+        lambda: BodyModel(model_path=model_path, num_betas=num_betas),
+        lambda: BodyModel(model_fname=model_path, num_betas=num_betas),
+        lambda: BodyModel(model_path, num_betas=num_betas),
+        lambda: BodyModel(model_path, model_type=model_type, num_betas=num_betas),
+        lambda: BodyModel(model_path, model_type, num_betas=num_betas),
+        lambda: BodyModel(bm_fname=model_path),
+        lambda: BodyModel(model_path=model_path),
+        lambda: BodyModel(model_fname=model_path),
+        lambda: BodyModel(model_path, model_type=model_type),
+        lambda: BodyModel(model_path, model_type),
+        lambda: BodyModel(model_path),
+    ]
+    errors: List[str] = []
+    for build in attempts:
+        try:
+            return build()
+        except TypeError as exc:
+            errors.append(str(exc))
+    raise TypeError(
+        "Could not construct human_body_prior BodyModel with this installation. "
+        "Tried bm_fname/model_path/model_fname/positional+model_type variants. Last errors: "
+        + " | ".join(errors[-3:])
+    )
+
+
+def patch_human_body_prior_lbs_dtype_compat() -> None:
+    """Allow human_body_prior 0.8.x to run with smplx.lbs variants lacking dtype."""
+    try:
+        import human_body_prior.body_model.body_model as body_model_module
+    except ImportError:
+        return
+
+    lbs_fn = getattr(body_model_module, "lbs", None)
+    if lbs_fn is None:
+        return
+    try:
+        signature = inspect.signature(lbs_fn)
+    except (TypeError, ValueError):
+        return
+    if "dtype" in signature.parameters or getattr(lbs_fn, "_accepts_ignored_dtype", False):
+        return
+
+    @functools.wraps(lbs_fn)
+    def lbs_accepting_ignored_dtype(*args, dtype=None, **kwargs):
+        return lbs_fn(*args, **kwargs)
+
+    lbs_accepting_ignored_dtype._accepts_ignored_dtype = True
+    body_model_module.lbs = lbs_accepting_ignored_dtype
 
 
 def create_body_model(body_model_path: Path, num_betas: int, device: torch.device):
@@ -1129,10 +1354,61 @@ def create_body_model(body_model_path: Path, num_betas: int, device: torch.devic
 
     if not body_model_path.exists():
         raise FileNotFoundError(f"SMPL-H body model not found: {body_model_path}")
-    model = BodyModel(bm_fname=str(body_model_path), num_betas=num_betas)
+    model = instantiate_body_model(BodyModel, body_model_path, num_betas)
     model = model.to(device)
     model.eval()
     return model
+
+
+def call_body_model(
+    body_model,
+    *,
+    pose_body: torch.Tensor,
+    pose_hand: torch.Tensor,
+    betas: torch.Tensor,
+    root_orient: torch.Tensor,
+    trans: torch.Tensor,
+):
+    attempts = [
+        lambda: body_model(
+            pose_body=pose_body,
+            pose_hand=pose_hand,
+            betas=betas,
+            root_orient=root_orient,
+            trans=trans,
+        ),
+        lambda: body_model(
+            body_pose=pose_body,
+            left_hand_pose=pose_hand[:, :45],
+            right_hand_pose=pose_hand[:, 45:90],
+            betas=betas,
+            global_orient=root_orient,
+            transl=trans,
+            return_verts=True,
+        ),
+    ]
+    errors: List[str] = []
+    for build in attempts:
+        try:
+            return build()
+        except TypeError as exc:
+            errors.append(str(exc))
+    raise TypeError(
+        "Could not call BodyModel forward with human_body_prior or SMPLX-style arguments. "
+        "Last errors: "
+        + " | ".join(errors[-2:])
+    )
+
+
+def body_model_output_tensor(output, *names: str) -> torch.Tensor:
+    for name in names:
+        if hasattr(output, name):
+            value = getattr(output, name)
+            if value is not None:
+                return value
+        if isinstance(output, dict) and output.get(name) is not None:
+            return output[name]
+    raise AttributeError(f"BodyModel output is missing expected tensor field(s): {', '.join(names)}")
 
 
 def body_model_rest_root(body_model, num_betas: int, device: torch.device) -> np.ndarray:
@@ -1141,14 +1417,15 @@ def body_model_rest_root(body_model, num_betas: int, device: torch.device) -> np
 
 def body_model_rest_joints(body_model, num_betas: int, device: torch.device) -> np.ndarray:
     with torch.no_grad():
-        out = body_model(
+        out = call_body_model(
+            body_model,
             pose_body=torch.zeros(1, 63, dtype=torch.float32, device=device),
             pose_hand=torch.zeros(1, 90, dtype=torch.float32, device=device),
             betas=torch.zeros(1, num_betas, dtype=torch.float32, device=device),
             root_orient=torch.zeros(1, 3, dtype=torch.float32, device=device),
             trans=torch.zeros(1, 3, dtype=torch.float32, device=device),
         )
-    return out.Jtr[0].detach().cpu().numpy().astype(np.float32)
+    return body_model_output_tensor(out, "Jtr", "joints")[0].detach().cpu().numpy().astype(np.float32)
 
 
 def estimate_fps(time_code_ms: np.ndarray) -> float:
@@ -1163,9 +1440,10 @@ def estimate_fps(time_code_ms: np.ndarray) -> float:
 
 def check_rotation_orthogonality(name: str, rotmats: np.ndarray, atol: float = 1e-3) -> None:
     eye = np.eye(3, dtype=np.float32)
-    err = np.max(np.abs(np.matmul(np.swapaxes(rotmats, -1, -2), rotmats) - eye))
-    det_min = float(np.min(np.linalg.det(rotmats.reshape(-1, 3, 3))))
-    det_max = float(np.max(np.linalg.det(rotmats.reshape(-1, 3, 3))))
+    err = np.max(np.abs(matmul3(np.swapaxes(rotmats, -1, -2), rotmats) - eye))
+    det_values = det3(rotmats.reshape(-1, 3, 3))
+    det_min = float(np.min(det_values))
+    det_max = float(np.max(det_values))
     if err > atol or det_min < 1.0 - atol or det_max > 1.0 + atol:
         raise ValueError(
             f"{name} rotation check failed: orthogonality max error={err:.6g}, "
