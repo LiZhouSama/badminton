@@ -75,6 +75,7 @@ class RealtimeSmplhFrame:
     trans: np.ndarray
     betas: np.ndarray
     vertices: Optional[np.ndarray] = None
+    right_palm_position: Optional[np.ndarray] = None
     host_wall_ts_s: float = float("nan")
     host_perf_ts_s: float = float("nan")
 
@@ -87,6 +88,7 @@ class SharedRealtimeState:
         self.latest_vertices_sample_counter: Optional[int] = None
         self.latest_vertices_host_wall_ts_s: Optional[float] = None
         self.latest_vertices_host_perf_ts_s: Optional[float] = None
+        self.latest_right_palm_position: Optional[np.ndarray] = None
         self.latest_sample_counter: Optional[int] = None
         self.latest_time_code_ms: Optional[int] = None
         self.latest_host_wall_ts_s: Optional[float] = None
@@ -163,11 +165,27 @@ class RealtimeSmplhRetargeter:
         pose = np.concatenate([root_orient, pose_body, pose_hand], axis=1).astype(np.float32)
         betas = np.zeros((1, self.num_betas), dtype=np.float32)
 
-        vertices = (
-            self._forward_vertices(root_orient, pose_body, pose_hand, trans, betas)
-            if include_vertices
-            else None
-        )
+        vertices = None
+        right_palm_position = None
+        if include_vertices:
+            vertices, joints = self._forward_vertices_and_joints(
+                root_orient,
+                pose_body,
+                pose_hand,
+                trans,
+                betas,
+            )
+            # SMPL-H has no explicit palm-center joint. Averaging the wrist and
+            # four metacarpophalangeal joints gives a stable point inside the
+            # palm and avoids coupling the racket anchor to finger flexion.
+            if joints.shape[0] > 46:
+                right_palm_position = np.mean(
+                    joints[[21, 37, 40, 43, 46]],
+                    axis=0,
+                    dtype=np.float32,
+                ).astype(np.float32)
+            elif joints.shape[0] > 21:
+                right_palm_position = joints[21].copy()
         return RealtimeSmplhFrame(
             sample_counter=frame.sample_counter,
             time_code_ms=frame.time_code_ms,
@@ -178,16 +196,17 @@ class RealtimeSmplhRetargeter:
             trans=trans[0],
             betas=betas[0],
             vertices=vertices,
+            right_palm_position=right_palm_position,
         )
 
-    def _forward_vertices(
+    def _forward_vertices_and_joints(
         self,
         root_orient: np.ndarray,
         pose_body: np.ndarray,
         pose_hand: np.ndarray,
         trans: np.ndarray,
         betas: np.ndarray,
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         with torch.no_grad():
             out = call_body_model(
                 self.body_model,
@@ -197,7 +216,9 @@ class RealtimeSmplhRetargeter:
                 root_orient=torch.from_numpy(root_orient.astype(np.float32)).to(self.device),
                 trans=torch.from_numpy(trans).to(self.device),
             )
-        return body_model_output_tensor(out, "v", "vertices")[0].detach().cpu().numpy().astype(np.float32)
+        vertices = body_model_output_tensor(out, "v", "vertices")[0].detach().cpu().numpy().astype(np.float32)
+        joints = body_model_output_tensor(out, "Jtr", "joints")[0].detach().cpu().numpy().astype(np.float32)
+        return vertices, joints
 
     def metadata(self, source_pose_csv: Path) -> Dict[str, object]:
         return {
@@ -398,6 +419,101 @@ def smplh_vertices_to_pyqtgraph(vertices: np.ndarray) -> np.ndarray:
     return display_vertices
 
 
+def make_balanced_body_shader():
+    """Return a camera-relative shader with enough fill light for dark poses."""
+    from pyqtgraph.opengl.shaders import FragmentShader, ShaderProgram, VertexShader
+
+    return ShaderProgram(
+        "balanced_body",
+        [
+            VertexShader(
+                """
+                uniform mat4 u_mvp;
+                uniform mat3 u_normal;
+                attribute vec4 a_position;
+                attribute vec3 a_normal;
+                attribute vec4 a_color;
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    v_normal = normalize(u_normal * a_normal);
+                    v_color = a_color;
+                    gl_Position = u_mvp * a_position;
+                }
+                """
+            ),
+            FragmentShader(
+                """
+                #ifdef GL_ES
+                precision mediump float;
+                #endif
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    vec3 n = normalize(v_normal);
+                    float key = abs(dot(n, normalize(vec3(-0.4, -0.6, 0.7))));
+                    float fill = abs(dot(n, normalize(vec3(0.7, 0.2, 0.4))));
+                    float brightness = 0.48 + 0.38 * key + 0.14 * fill;
+                    gl_FragColor = vec4(v_color.rgb * brightness, v_color.a);
+                }
+                """
+            ),
+        ],
+    )
+
+
+def make_checkerboard_floor(
+    gl,
+    *,
+    size: float = 4.0,
+    tile_size: float = 0.5,
+    z: float = -0.005,
+):
+    """Build an opaque, unlit checkerboard centered on the world origin."""
+    tile_count = max(2, int(round(size / tile_size)))
+    actual_size = tile_count * tile_size
+    start = -0.5 * actual_size
+    vertices: List[List[float]] = []
+    faces: List[List[int]] = []
+    face_colors: List[Tuple[float, float, float, float]] = []
+    colors = (
+        (0.20, 0.23, 0.27, 1.0),
+        (0.46, 0.50, 0.54, 1.0),
+    )
+
+    for row in range(tile_count):
+        for col in range(tile_count):
+            x0 = start + col * tile_size
+            x1 = x0 + tile_size
+            y0 = start + row * tile_size
+            y1 = y0 + tile_size
+            base = len(vertices)
+            vertices.extend(
+                [
+                    [x0, y0, z],
+                    [x1, y0, z],
+                    [x1, y1, z],
+                    [x0, y1, z],
+                ]
+            )
+            faces.extend([[base, base + 1, base + 2], [base, base + 2, base + 3]])
+            color = colors[(row + col) % 2]
+            face_colors.extend([color, color])
+
+    floor = gl.GLMeshItem(
+        vertexes=np.asarray(vertices, dtype=np.float32),
+        faces=np.asarray(faces, dtype=np.uint32),
+        faceColors=np.asarray(face_colors, dtype=np.float32),
+        smooth=False,
+        computeNormals=False,
+        drawEdges=False,
+        drawFaces=True,
+        shader=None,
+    )
+    floor.setGLOptions("opaque")
+    return floor
+
+
 def windows_udp_destination_hint() -> str:
     return (
         "Windows UDP hint: in Xsens Network Streamer, set Host to 127.0.0.1 when MVN and this "
@@ -547,6 +663,7 @@ def retarget_worker(
                         state.latest_vertices_sample_counter = smplh_frame.sample_counter
                         state.latest_vertices_host_wall_ts_s = smplh_frame.host_wall_ts_s
                         state.latest_vertices_host_perf_ts_s = smplh_frame.host_perf_ts_s
+                        state.latest_right_palm_position = smplh_frame.right_palm_position
                         state.counters["mesh_frames"] += 1
                         last_mesh_s = now_s
 
@@ -676,18 +793,14 @@ def run_pyqtgraph_viewer(
     win.setWindowTitle("Realtime Xsens MVN -> SMPL-H")
     layout = QtWidgets.QVBoxLayout(win)
     view = StableGLViewWidget()
-    view.setBackgroundColor("#666666")
+    view.setBackgroundColor("#20262d")
     view.opts["distance"] = 3.0
     view.opts["elevation"] = 15.0
     view.opts["azimuth"] = -65.0
     layout.addWidget(view, stretch=1)
 
-    grid = gl.GLGridItem()
-    grid.setSize(x=4.0, y=4.0, z=0.0)
-    grid.setSpacing(x=0.5, y=0.5, z=0.5)
-    if hasattr(grid, "setColor"):
-        grid.setColor((0.32, 0.32, 0.32, 1.0))
-    view.addItem(grid)
+    view.addItem(make_checkerboard_floor(gl))
+    body_shader = make_balanced_body_shader()
 
     label = QtWidgets.QLabel("Waiting for Xsens MVN UDP pose packets...")
     label.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
@@ -712,11 +825,11 @@ def run_pyqtgraph_viewer(
                 mesh_item["item"] = gl.GLMeshItem(
                     vertexes=display_vertices,
                     faces=retargeter.faces,
-                    color=(0.96, 0.96, 0.96, 1.0),
-                    smooth=False,
+                    color=(0.26, 0.68, 0.96, 1.0),
+                    smooth=True,
                     drawEdges=False,
                     drawFaces=True,
-                    shader="shaded",
+                    shader=body_shader,
                 )
                 view.addItem(mesh_item["item"])
             else:

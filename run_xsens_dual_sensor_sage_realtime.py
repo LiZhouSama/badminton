@@ -74,6 +74,18 @@ HUMAN0_TO_VIEW = np.array(
     dtype=np.float32,
 )
 
+# This is the exact coordinate conversion used by
+# xsens_rt.smplh_vertices_to_pyqtgraph(). Use it for every object rendered in
+# the SMPL-H view so racket positions and rotations share the body's frame.
+SMPL_TO_VIEW = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=np.float32,
+)
+
 
 @dataclass
 class TimelineItem:
@@ -107,12 +119,26 @@ class TimelineBuffer:
 class PressureVisualData:
     display_values: np.ndarray
     record: PressureFrame
+    interaction_active: bool
+    interaction_pressure_g: float
 
 
 @dataclass
 class XsensVisualData:
     sample_counter: int
     vertices: np.ndarray
+    right_palm_position: Optional[np.ndarray]
+
+
+def pressure_interaction_state(
+    was_active: bool,
+    peak_pressure_g: float,
+    attach_threshold_g: float,
+    release_threshold_g: float,
+) -> bool:
+    if was_active:
+        return peak_pressure_g > release_threshold_g
+    return peak_pressure_g >= attach_threshold_g
 
 
 def unique_dir(path: Path) -> Path:
@@ -165,6 +191,8 @@ class DualSensorRealtimeRuntime:
         )
         self.pressure_recording_enabled = args.disable_pressure
         self.startup_zero_pending = not args.disable_pressure
+        self.interaction_active = False
+        self.interaction_pressure_g = 0.0
 
         self.imu_init_rot_world: Optional[np.ndarray] = None
         self.imu_zero_status_msg = "IMU zero: waiting first frame"
@@ -416,6 +444,16 @@ class DualSensorRealtimeRuntime:
                         print("[PRESSURE] Startup zero calibration completed; pressure recording enabled")
 
             corrected = np.maximum(raw_vals - self.zero_offset, 0.0) if self.zero_enabled else raw_vals
+            self.interaction_pressure_g = float(np.max(corrected))
+            if self.pressure_recording_enabled and frame.checksum_ok and not self.zero_calibrating:
+                self.interaction_active = pressure_interaction_state(
+                    self.interaction_active,
+                    self.interaction_pressure_g,
+                    self.args.interaction_pressure_threshold,
+                    self.args.interaction_release_threshold,
+                )
+            elif self.zero_calibrating:
+                self.interaction_active = False
             csv_vals = pressure_for_csv(
                 corrected,
                 self.args.transpose,
@@ -442,7 +480,12 @@ class DualSensorRealtimeRuntime:
                 TimelineItem(
                     host_ts=frame.host_ts,
                     host_wall_ts_s=frame.host_wall_ts_s,
-                    data=PressureVisualData(display_values=display_vals, record=pressure_record),
+                    data=PressureVisualData(
+                        display_values=display_vals,
+                        record=pressure_record,
+                        interaction_active=self.interaction_active,
+                        interaction_pressure_g=self.interaction_pressure_g,
+                    ),
                 )
             )
 
@@ -500,6 +543,7 @@ class DualSensorRealtimeRuntime:
             self.zero_start_ts = time.perf_counter()
             self.zero_samples = []
             self.zero_status_msg = f"{UI_TEXT['zero_running']} ({duration_sec:.1f}s)"
+            self.interaction_active = False
         print(f"[PRESSURE] Zero calibration started ({duration_sec:.1f}s)")
 
     def clear_zero_calibration(self) -> None:
@@ -509,6 +553,7 @@ class DualSensorRealtimeRuntime:
             self.zero_samples.clear()
             self.zero_offset = np.zeros((16, 16), dtype=np.float32)
             self.zero_status_msg = UI_TEXT["zero_cleared"]
+            self.interaction_active = False
         print("[PRESSURE] Zero calibration cleared")
 
     def reset_imu_zero_pose(self) -> None:
@@ -533,6 +578,8 @@ class DualSensorRealtimeRuntime:
                 else 0.0,
                 "zero_samples": len(self.zero_samples),
                 "imu_zero_status": self.imu_zero_status_msg,
+                "interaction_active": self.interaction_active,
+                "interaction_pressure_g": self.interaction_pressure_g,
             }
 
     def maybe_write_clock_sync_sample(self) -> None:
@@ -583,6 +630,20 @@ def source_lag_text(sample: Optional[TimelineItem], target_ts: float) -> str:
     return f"{(sample.host_ts - target_ts) * 1000.0:+.1f}ms"
 
 
+def qmatrix_from_pose(rot: np.ndarray, translation: np.ndarray, QtGui):
+    transform = qmatrix_from_rot3(rot, QtGui)
+    transform.setColumn(
+        3,
+        QtGui.QVector4D(
+            float(translation[0]),
+            float(translation[1]),
+            float(translation[2]),
+            1.0,
+        ),
+    )
+    return transform
+
+
 def poll_xsens_mesh(
     runtime: Optional[xsens_rt.RealtimeSmplhRuntime],
     mesh_buffer: TimelineBuffer,
@@ -595,6 +656,11 @@ def poll_xsens_mesh(
         host_ts = runtime.state.latest_vertices_host_perf_ts_s
         host_wall_ts_s = runtime.state.latest_vertices_host_wall_ts_s
         vertices = None if runtime.state.latest_vertices is None else runtime.state.latest_vertices.copy()
+        right_palm_position = (
+            None
+            if runtime.state.latest_right_palm_position is None
+            else runtime.state.latest_right_palm_position.copy()
+        )
     if sample_counter is None or host_ts is None or vertices is None:
         return
     if last_seen.get("sample_counter") == sample_counter:
@@ -603,7 +669,11 @@ def poll_xsens_mesh(
         TimelineItem(
             host_ts=host_ts,
             host_wall_ts_s=float("nan") if host_wall_ts_s is None else host_wall_ts_s,
-            data=XsensVisualData(sample_counter=sample_counter, vertices=vertices),
+            data=XsensVisualData(
+                sample_counter=sample_counter,
+                vertices=vertices,
+                right_palm_position=right_palm_position,
+            ),
         )
     )
     last_seen["sample_counter"] = sample_counter
@@ -740,6 +810,7 @@ def run_combined_viewer(
         wire_head_item = None
         wire_face_item = None
         racket_mesh_item = None
+        racket_mesh_kwargs: Optional[Dict[str, Any]] = None
 
         if not args.no_racket_obj:
             obj_path = Path(args.racket_obj)
@@ -769,6 +840,7 @@ def run_combined_viewer(
                     mesh_kwargs["shader"] = None
                 else:
                     mesh_kwargs["color"] = (0.87, 0.87, 0.92, 1.0)
+                racket_mesh_kwargs = mesh_kwargs
                 racket_mesh_item = gl.GLMeshItem(**mesh_kwargs)
                 imu_view.addItem(racket_mesh_item)
                 racket_mesh_item.setTransform(qmatrix_from_rot3(racket_init_to_view, QtGui))
@@ -813,6 +885,7 @@ def run_combined_viewer(
                 "wire_shaft_sensor": wire_shaft_sensor,
                 "wire_head_sensor": wire_head_sensor,
                 "wire_face_sensor": wire_face_sensor,
+                "racket_mesh_kwargs": racket_mesh_kwargs,
             }
         )
 
@@ -830,19 +903,81 @@ def run_combined_viewer(
         xsens_state["error"] = msg
     else:
         xsens_view = StableGLViewWidget()
-        xsens_view.setBackgroundColor("#666666")
+        xsens_view.setBackgroundColor("#20262d")
         xsens_view.opts["distance"] = 3.0
         xsens_view.opts["elevation"] = 15.0
         xsens_view.opts["azimuth"] = -65.0
         splitter.addWidget(xsens_view)
 
-        grid = gl.GLGridItem()
-        grid.setSize(x=4.0, y=4.0, z=0.0)
-        grid.setSpacing(x=0.5, y=0.5, z=0.5)
-        if hasattr(grid, "setColor"):
-            grid.setColor((0.32, 0.32, 0.32, 1.0))
-        xsens_view.addItem(grid)
-        xsens_state.update({"enabled": True, "view": xsens_view, "mesh_item": None})
+        xsens_view.addItem(xsens_rt.make_checkerboard_floor(gl))
+        xsens_state.update(
+            {
+                "enabled": True,
+                "view": xsens_view,
+                "mesh_item": None,
+                "body_shader": xsens_rt.make_balanced_body_shader(),
+                "racket_position_smpl": np.asarray(
+                    args.human_racket_initial_position,
+                    dtype=np.float32,
+                ),
+                "racket_interacting": False,
+            }
+        )
+
+        # Keep the original standalone IMU racket view above. This is a second
+        # racket instance rendered in the SMPL-H view.
+        if imu_state.get("enabled"):
+            human_racket_mesh_item = None
+            human_wire_shaft_item = None
+            human_wire_head_item = None
+            human_wire_face_item = None
+            initial_rot_view = SMPL_TO_VIEW @ dual_runtime.racket_init_to_human
+            initial_pos_view = SMPL_TO_VIEW @ xsens_state["racket_position_smpl"]
+
+            if imu_state.get("racket_mesh_kwargs") is not None:
+                human_racket_mesh_item = gl.GLMeshItem(**imu_state["racket_mesh_kwargs"])
+                human_racket_mesh_item.setTransform(
+                    qmatrix_from_pose(initial_rot_view, initial_pos_view, QtGui)
+                )
+                xsens_view.addItem(human_racket_mesh_item)
+            else:
+                human_wire_shaft_item = gl.GLLinePlotItem(
+                    pos=rotate_points(imu_state["wire_shaft_sensor"], initial_rot_view) + initial_pos_view,
+                    color=(1.0, 0.9, 0.2, 1.0),
+                    width=4.0,
+                    antialias=True,
+                    mode="line_strip",
+                )
+                human_wire_head_item = gl.GLLinePlotItem(
+                    pos=rotate_points(imu_state["wire_head_sensor"], initial_rot_view) + initial_pos_view,
+                    color=(0.1, 0.8, 1.0, 1.0),
+                    width=2.0,
+                    antialias=True,
+                    mode="line_strip",
+                )
+                human_wire_face_item = gl.GLLinePlotItem(
+                    pos=rotate_points(imu_state["wire_face_sensor"], initial_rot_view) + initial_pos_view,
+                    color=(1.0, 0.3, 0.3, 1.0),
+                    width=2.0,
+                    antialias=True,
+                    mode="line_strip",
+                )
+                xsens_view.addItem(human_wire_shaft_item)
+                xsens_view.addItem(human_wire_head_item)
+                xsens_view.addItem(human_wire_face_item)
+
+            xsens_state.update(
+                {
+                    "racket_enabled": True,
+                    "racket_mesh_item": human_racket_mesh_item,
+                    "racket_wire_shaft_item": human_wire_shaft_item,
+                    "racket_wire_head_item": human_wire_head_item,
+                    "racket_wire_face_item": human_wire_face_item,
+                    "racket_wire_shaft_sensor": imu_state["wire_shaft_sensor"],
+                    "racket_wire_head_sensor": imu_state["wire_head_sensor"],
+                    "racket_wire_face_sensor": imu_state["wire_face_sensor"],
+                }
+            )
 
     status_label = QtWidgets.QLabel("Waiting data...")
     status_label.setStyleSheet("font-family: Consolas, monospace; font-size: 12px;")
@@ -921,11 +1056,11 @@ def run_combined_viewer(
                     xsens_state["mesh_item"] = gl.GLMeshItem(
                         vertexes=display_vertices,
                         faces=xsens_runtime.retargeter.faces,
-                        color=(0.96, 0.96, 0.96, 1.0),
-                        smooth=False,
+                        color=(0.26, 0.68, 0.96, 1.0),
+                        smooth=True,
                         drawEdges=False,
                         drawFaces=True,
-                        shader="shaded",
+                        shader=xsens_state["body_shader"],
                     )
                     xsens_state["view"].addItem(xsens_state["mesh_item"])
                 else:
@@ -934,6 +1069,59 @@ def run_combined_viewer(
                         faces=xsens_runtime.retargeter.faces,
                     )
                 xsens_state["last_sample"] = xsens_data.sample_counter
+
+        pressure_is_fresh = bool(
+            pressure_item is not None
+            and target_ts - pressure_item.host_ts
+            <= args.interaction_pressure_timeout_ms / 1000.0
+        )
+        interaction_active = bool(
+            pressure_is_fresh and pressure_item.data.interaction_active
+        )
+        if xsens_state.get("racket_enabled") and imu_item is not None:
+            xsens_data = xsens_item.data if xsens_item is not None else None
+            right_palm_position = (
+                None if xsens_data is None else xsens_data.right_palm_position
+            )
+            if interaction_active and right_palm_position is not None:
+                # The prepared racket's origin is the grip center, so assigning
+                # the palm center here teleports the handle to the hand and
+                # keeps the positions attached until contact ends.
+                xsens_state["racket_position_smpl"] = right_palm_position.copy()
+
+            imu_frame = imu_item.data
+            racket_rot_view = SMPL_TO_VIEW @ imu_frame.rot_human
+            racket_pos_view = SMPL_TO_VIEW @ xsens_state["racket_position_smpl"]
+            if xsens_state.get("racket_mesh_item") is not None and QtGui is not None:
+                xsens_state["racket_mesh_item"].setTransform(
+                    qmatrix_from_pose(racket_rot_view, racket_pos_view, QtGui)
+                )
+            else:
+                if xsens_state.get("racket_wire_shaft_item") is not None:
+                    xsens_state["racket_wire_shaft_item"].setData(
+                        pos=rotate_points(
+                            xsens_state["racket_wire_shaft_sensor"],
+                            racket_rot_view,
+                        )
+                        + racket_pos_view
+                    )
+                if xsens_state.get("racket_wire_head_item") is not None:
+                    xsens_state["racket_wire_head_item"].setData(
+                        pos=rotate_points(
+                            xsens_state["racket_wire_head_sensor"],
+                            racket_rot_view,
+                        )
+                        + racket_pos_view
+                    )
+                if xsens_state.get("racket_wire_face_item") is not None:
+                    xsens_state["racket_wire_face_item"].setData(
+                        pos=rotate_points(
+                            xsens_state["racket_wire_face_sensor"],
+                            racket_rot_view,
+                        )
+                        + racket_pos_view
+                    )
+            xsens_state["racket_interacting"] = interaction_active
 
         elapsed = max(1e-6, now - start_ts)
         lines = [
@@ -1003,6 +1191,19 @@ def run_combined_viewer(
             if pressure_item is not None:
                 p_record: PressureFrame = pressure_item.data.record
                 lines.append(f"P mean/max = {float(np.mean(p_record.values)):.1f}/{float(np.max(p_record.values)):.1f} g")
+                interaction_text = "ATTACHED" if interaction_active else "free"
+                if interaction_active and (
+                    xsens_item is None or xsens_item.data.right_palm_position is None
+                ):
+                    interaction_text = "waiting for right palm"
+                lines.append(
+                    "Human-view racket: {} | peak={:.1f}g | attach/release={:.1f}/{:.1f}g | rotation=IMU".format(
+                        interaction_text,
+                        pressure_item.data.interaction_pressure_g,
+                        args.interaction_pressure_threshold,
+                        args.interaction_release_threshold,
+                    )
+                )
             if imu_item is not None:
                 imu_frame = imu_item.data
                 ax, ay, az = imu_frame.acc_human_g
@@ -1116,6 +1317,32 @@ def parse_args() -> argparse.Namespace:
     dual.add_argument("--racket-align-roll", type=float, default=0.0)
     dual.add_argument("--racket-align-pitch", type=float, default=0.0)
     dual.add_argument("--racket-align-yaw", type=float, default=0.0)
+    dual.add_argument(
+        "--interaction-pressure-threshold",
+        type=float,
+        default=100.0,
+        help="Attach the human-view racket when the peak zero-corrected pressure reaches this value in grams.",
+    )
+    dual.add_argument(
+        "--interaction-release-threshold",
+        type=float,
+        default=80.0,
+        help="Release the human-view racket when peak pressure falls to this value in grams.",
+    )
+    dual.add_argument(
+        "--interaction-pressure-timeout-ms",
+        type=float,
+        default=500.0,
+        help="Release attachment when no fresh pressure frame has arrived within this interval.",
+    )
+    dual.add_argument(
+        "--human-racket-initial-position",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help="Initial grip-center position in the SMPL-H world frame, in meters.",
+    )
 
     xsens = parser.add_argument_group("Xsens MVN SMPL-H")
     xsens.add_argument("--xsens-bind-ip", default="0.0.0.0")
@@ -1144,7 +1371,16 @@ def parse_args() -> argparse.Namespace:
     xsens.add_argument("--xsens-pt-checkpoint-every-frames", type=int, default=0)
     xsens.add_argument("--xsens-retarget-queue-size", type=int, default=1024)
     xsens.add_argument("--xsens-keep-stale-retarget-frames", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.interaction_pressure_threshold < 0.0:
+        parser.error("--interaction-pressure-threshold must be non-negative")
+    if args.interaction_release_threshold < 0.0:
+        parser.error("--interaction-release-threshold must be non-negative")
+    if args.interaction_release_threshold > args.interaction_pressure_threshold:
+        parser.error("--interaction-release-threshold must not exceed --interaction-pressure-threshold")
+    if args.interaction_pressure_timeout_ms <= 0.0:
+        parser.error("--interaction-pressure-timeout-ms must be positive")
+    return args
 
 
 def install_signal_handlers(
